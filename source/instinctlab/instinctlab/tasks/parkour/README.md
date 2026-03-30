@@ -16,13 +16,49 @@ python scripts/instinct_rl/train.py --headless --task=Instinct-Parkour-Target-Am
 3. Play trained policy (load_run must be provided, absolute path is recommended, or use `--no_resume` to visualize untrained policy):
 
 ```bash
-python source/instinctlab/instinctlab/tasks/parkour/scripts/play.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name>
+python scripts/instinct_rl/play_depth.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name>
 ```
+
+Recommended interactive depth-debug and recording command:
+
+```bash
+OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
+    --task=Instinct-Parkour-Target-Amp-G1-v0 \
+    --load_run=20260327_163647 \
+    --keyboard_control \
+    --num_envs=1 \
+    --video \
+    --show_depth_window \
+    --show_depth_coverage \
+    --disable_auto_reset \
+    --video_duration_s 300
+```
+
+What this command does:
+
+- `OMNI_KIT_ACCEPT_EULA=YES`: skips the interactive Isaac Sim EULA prompt in terminal runs.
+- `--keyboard_control`: lets you steer the robot manually with the keyboard.
+- `--num_envs=1`: forces a single robot instance so the play view, keyboard commands, and recording stay easy to inspect.
+- `--video`: enables video recording.
+- `--show_depth_window`: opens a live depth preview window.
+- `--show_depth_coverage`: shows the raw camera coverage footprint in the RGB scene.
+- `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
+- `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
+
+Notes:
+
+- The red coverage visualization shows the raw grouped ray-caster field of view. The policy depth observation is still a cropped lower-center patch after preprocessing.
+- Keyboard commands during play are:
+  - `W`: increase forward command
+  - `F`: positive yaw
+  - `G`: negative yaw
+  - `S`: reset yaw to zero
+  - `X`: zero all commands
 
 4. Export trained policy (load_run must be provided, absolute path is recommended):
 
 ```bash
-python source/instinctlab/instinctlab/tasks/parkour/scripts/play.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name> --exportonnx --useonnx
+python scripts/instinct_rl/play_depth.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name> --exportonnx --useonnx
 ```
 
 5. Validate the exported ONNX policy in MuJoCo:
@@ -37,17 +73,6 @@ python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --headless --dep
 ```bash
 python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --keyboard_control --depth-mode=mujoco
 ```
-
-OMNI_KIT_ACCEPT_EULA=YES python source/instinctlab/instinctlab/tasks/parkour/scripts/play.py \
-    --task=Instinct-Parkour-Target-Amp-G1-v0 \
-    --load_run=20260327_163647 \
-    --keyboard_control \
-    --num_envs=1 \
-    --video \
-    --show_depth_window \
-    --show_depth_coverage \
-    --disable_auto_reset \
-    --video_duration_s 300
 
 ## Common Options
 

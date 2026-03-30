@@ -4,7 +4,7 @@
 
 **Goal:** Extend the parkour Isaac play flow so it can record a composite video with multiple external RGB cameras plus the live depth view, pin the robot to the map center when requested, optionally disable automatic resets, and visualize the depth camera coverage inside the RGB scene.
 
-**Architecture:** Keep the policy/play loop in [`source/instinctlab/instinctlab/tasks/parkour/scripts/play.py`](/home/eilab/instinctlab/source/instinctlab/instinctlab/tasks/parkour/scripts/play.py), but move argument parsing helpers, config override logic, camera pose math, depth normalization, and frame composition into a new pure-Python helper module that can be unit-tested without launching Isaac. Use Isaac Lab `Camera` sensors plus existing grouped-ray-caster hit data during integration so the live scene wiring stays thin and the new behavior is built from supported camera/render primitives already present in the codebase.
+**Architecture:** Keep the policy/play loop in [`play_depth.py`](/home/eilab/instinctlab/scripts/instinct_rl/play_depth.py), but move argument parsing helpers, config override logic, camera pose math, depth normalization, and frame composition into a new pure-Python helper module that can be unit-tested without launching Isaac. Use Isaac Lab `Camera` sensors plus existing grouped-ray-caster hit data during integration so the live scene wiring stays thin and the new behavior is built from supported camera/render primitives already present in the codebase.
 
 **Tech Stack:** Python 3.11, Isaac Lab / Isaac Sim camera sensors, Gymnasium play script flow, NumPy, OpenCV, imageio, pytest.
 
@@ -86,7 +86,7 @@ Expected: PASS.
 ### Task 3: Wire the runtime overrides into the Isaac play script
 
 **Files:**
-- Modify: `source/instinctlab/instinctlab/tasks/parkour/scripts/play.py`
+- Modify: `scripts/instinct_rl/play_depth.py`
 
 **Step 1: Import the new helper surface and add CLI flags**
 
@@ -112,7 +112,7 @@ Use the terrain importer’s `terrain_origins` / `env_origins` data so reset eve
 ### Task 4: Add multi-camera RGB capture and composite recording
 
 **Files:**
-- Modify: `source/instinctlab/instinctlab/tasks/parkour/scripts/play.py`
+- Modify: `scripts/instinct_rl/play_depth.py`
 
 **Step 1: Replace the legacy single-view recording path with a composite recorder**
 
@@ -133,7 +133,7 @@ Start writing at `--video_start_step` and stop automatically after `--video_leng
 ### Task 5: Add the live depth window and depth-coverage overlay
 
 **Files:**
-- Modify: `source/instinctlab/instinctlab/tasks/parkour/scripts/play.py`
+- Modify: `scripts/instinct_rl/play_depth.py`
 
 **Step 1: Open a live depth window only when requested**
 

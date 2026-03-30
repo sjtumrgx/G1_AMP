@@ -254,6 +254,50 @@ def test_ensure_sensor_initialized_raises_if_callback_does_not_initialize():
     assert "bad_sensor" in message
 
 
+def test_create_keyboard_event_subscription_keeps_handle_and_unsubscribes():
+    module = load_module()
+
+    class FakeAppWindow:
+        def __init__(self):
+            self.keyboard = object()
+
+        def get_keyboard(self):
+            return self.keyboard
+
+    class FakeInputInterface:
+        def __init__(self):
+            self.subscribed = []
+            self.unsubscribed = []
+
+        def subscribe_to_keyboard_events(self, keyboard, callback):
+            token = object()
+            self.subscribed.append((keyboard, callback, token))
+            return token
+
+        def unsubscribe_to_keyboard_events(self, keyboard, token):
+            self.unsubscribed.append((keyboard, token))
+
+    callback = lambda event: None
+    app_window = FakeAppWindow()
+    input_interface = FakeInputInterface()
+
+    subscription = module.create_keyboard_event_subscription(
+        callback=callback,
+        app_window=app_window,
+        input_interface=input_interface,
+    )
+
+    assert subscription.callback is callback
+    assert subscription.keyboard is app_window.keyboard
+    token = input_interface.subscribed[0][2]
+    assert subscription.handle is token
+
+    subscription.close()
+
+    assert input_interface.unsubscribed == [(app_window.keyboard, token)]
+    assert subscription.handle is None
+
+
 def test_select_map_center_xy_prefers_geometric_middle():
     module = load_module()
     terrain_origins = np.array(

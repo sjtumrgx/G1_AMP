@@ -27,6 +27,20 @@ class VideoCaptureSettings:
     frame_stride: int
 
 
+@dataclass
+class KeyboardEventSubscription:
+    input_interface: object
+    keyboard: object
+    handle: object
+    callback: object
+
+    def close(self) -> None:
+        if self.handle is None:
+            return
+        self.input_interface.unsubscribe_to_keyboard_events(self.keyboard, self.handle)
+        self.handle = None
+
+
 def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--center_spawn", action="store_true", default=False, help="Spawn at the map center.")
     parser.add_argument(
@@ -89,6 +103,25 @@ def validate_isaacsim_python_environment(numpy_version: str | None = None) -> No
             f" {current_numpy_version}, but Isaac Sim 5.1 / isaacsim-kernel requires numpy=={ISAACSIM_REQUIRED_NUMPY_VERSION}."
             " Downgrade numpy in this environment before launching play.py."
         )
+
+
+def create_keyboard_event_subscription(callback, app_window=None, input_interface=None) -> KeyboardEventSubscription:
+    if app_window is None:
+        import omni.appwindow
+
+        app_window = omni.appwindow.get_default_app_window()
+    if input_interface is None:
+        import carb.input
+
+        input_interface = carb.input.acquire_input_interface()
+    keyboard = app_window.get_keyboard()
+    handle = input_interface.subscribe_to_keyboard_events(keyboard, callback)
+    return KeyboardEventSubscription(
+        input_interface=input_interface,
+        keyboard=keyboard,
+        handle=handle,
+        callback=callback,
+    )
 
 
 def ensure_sensor_initialized(sensor, sensor_name: str | None = None) -> None:

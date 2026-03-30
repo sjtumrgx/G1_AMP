@@ -1,4 +1,4 @@
-# Project Instinct
+# G1_AMP
 
 [![IsaacSim](https://img.shields.io/badge/IsaacSim-5.1.0-silver.svg)](https://docs.omniverse.nvidia.com/isaacsim/latest/overview.html)
 [![Isaac Lab](https://img.shields.io/badge/IsaacLab-2.3.2-silver)](https://isaac-sim.github.io/IsaacLab)
@@ -9,7 +9,7 @@
 
 ## Overview
 
-This repository is the environment side of [Project-Instinct](https://project-instinct.github.io/).
+This repository is the environment side of the `G1_AMP` project.
 
 We aim at industralize Reinforcement Learning for Humanoid (legged robots) whole-body control.
 
@@ -17,7 +17,7 @@ We aim at industralize Reinforcement Learning for Humanoid (legged robots) whole
 
 - `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
 - `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
-- `Unified Ecosystem` This repository is a part of the Project-Instinct ecosystem, which includes the [instinct_rl](https://github.com/project-instinct/instinct_rl) and [instinct_onboard](https://github.com/project-instinct/instinct_onboard) repositories.
+- `Unified Ecosystem` This repository is a part of the `G1_AMP` ecosystem, which includes the [instinct_rl](https://github.com/project-instinct/instinct_rl) and [instinct_onboard](https://github.com/project-instinct/instinct_onboard) repositories.
     - The core design of this ecosystem is to treat each experiment as a standalone structured folder, which start with a timestamp as a unique identifier.
     - Adding `--exportonnx` flag to the `play.py` script will export the policy as an ONNX model. After that, you should directly copy the logdir to the robot computer and use the `instinct_onboard` workflow to run the policy on the real robot.
 
@@ -46,10 +46,10 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 
     ```bash
     # Option 1: HTTPS
-    git clone https://github.com/project-instinct/instinctlab.git
+    git clone https://github.com/sjtumrgx/G1_AMP.git
 
     # Option 2: SSH
-    git clone git@github.com:project-instinct/instinctlab.git
+    git clone git@github.com:sjtumrgx/G1_AMP.git
     ```
 
 - Using a python interpreter that has Isaac Lab installed, install the library
@@ -67,7 +67,7 @@ See [CONTRIBUTORS.md](CONTRIBUTORS.md) for a list of acknowledged contributors.
 ## Documentation of Critical Components
 
 - [Instinct-RL Documentation](https://github.com/project-instinct/instinct_rl/blob/main/README.md)
-- [InstinctLab Documentation](https://github.com/project-instinct/instinctlab/blob/main/DOCS.md)
+- [G1_AMP Documentation](https://github.com/sjtumrgx/G1_AMP/blob/main/DOCS.md)
 
 ### Set up IDE (Optional)
 

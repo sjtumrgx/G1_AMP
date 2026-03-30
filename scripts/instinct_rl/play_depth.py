@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 sys.path.append(os.path.join(os.getcwd(), "scripts", "instinct_rl"))
+sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab", "tasks", "parkour", "scripts"))
 
 from isaaclab.app import AppLauncher
 from play_runtime import (
@@ -16,6 +17,7 @@ from play_runtime import (
     build_default_tracking_camera_specs,
     compose_recording_frame,
     compute_tracking_camera_views,
+    create_keyboard_event_subscription,
     ensure_sensor_initialized,
     normalize_depth_frame_for_display,
     resolve_video_capture_settings,
@@ -315,6 +317,7 @@ def main():
     """Play with Instinct-RL agent."""
     env = None
     capture_rig = None
+    keyboard_subscription = None
     video_output_path = None
     interrupted = False
     # parse configuration
@@ -457,10 +460,7 @@ def main():
                 keyboard_controller.zero_all()
 
         if args_cli.keyboard_control:
-            app_window = omni.appwindow.get_default_app_window()
-            keyboard = app_window.get_keyboard()
-            input = carb.input.acquire_input_interface()
-            input.subscribe_to_keyboard_events(keyboard, on_keyboard_input)
+            keyboard_subscription = create_keyboard_event_subscription(on_keyboard_input)
 
         if args_cli.center_spawn or args_cli.keyboard_control:
             if _pin_first_env_to_center_origin(env.unwrapped):
@@ -530,6 +530,8 @@ def main():
         interrupted = True
         print("[INFO] KeyboardInterrupt received, finalizing partial video before exit.")
     finally:
+        if keyboard_subscription is not None:
+            keyboard_subscription.close()
         if capture_rig is not None:
             capture_rig.close()
         if env is not None:
