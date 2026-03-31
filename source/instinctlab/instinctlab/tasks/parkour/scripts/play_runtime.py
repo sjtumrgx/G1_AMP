@@ -149,7 +149,7 @@ def select_center_terrain_origin(terrain_origins) -> np.ndarray:
     center_xy = select_map_center_xy(origins)
     distances = np.sum((flattened[:, :2] - center_xy[None, :]) ** 2, axis=1)
     nearest_origin = flattened[int(np.argmin(distances))]
-    return np.array([center_xy[0], center_xy[1], nearest_origin[2]], dtype=np.float32)
+    return nearest_origin.astype(np.float32, copy=True)
 
 
 def apply_play_runtime_overrides(env_cfg, options) -> None:
@@ -166,8 +166,9 @@ def apply_play_runtime_overrides(env_cfg, options) -> None:
     if getattr(options, "show_depth_coverage", False):
         env_cfg.scene.camera.debug_vis = True
 
-    if getattr(options, "center_spawn", False):
+    if _should_enforce_center_spawn(options):
         _lock_center_spawn_pose(env_cfg)
+        _disable_terrain_curriculum(env_cfg)
 
     _configure_command_arrow_visuals(env_cfg, enabled=getattr(options, "show_command_arrow", False))
 
@@ -307,6 +308,22 @@ def _lock_center_spawn_pose(env_cfg) -> None:
         return
     for axis in ("x", "y"):
         pose_range[axis] = (0.0, 0.0)
+
+
+def _disable_terrain_curriculum(env_cfg) -> None:
+    curriculum = getattr(env_cfg, "curriculum", None)
+    if curriculum is None:
+        return
+    if isinstance(curriculum, dict):
+        if "terrain_levels" in curriculum:
+            curriculum["terrain_levels"] = None
+        return
+    if hasattr(curriculum, "terrain_levels"):
+        curriculum.terrain_levels = None
+
+
+def _should_enforce_center_spawn(options) -> bool:
+    return bool(getattr(options, "center_spawn", False) or getattr(options, "keyboard_control", False))
 
 
 def _ensure_rgb_uint8(frame) -> np.ndarray:

@@ -30,6 +30,7 @@ def load_module():
 def make_fake_env_cfg():
     return SimpleNamespace(
         episode_length_s=20.0,
+        curriculum=SimpleNamespace(terrain_levels="keep"),
         scene=SimpleNamespace(
             camera=SimpleNamespace(debug_vis=False),
         ),
@@ -129,10 +130,30 @@ def test_apply_play_runtime_overrides_disables_resets_and_enables_depth_debug():
     assert env_cfg.commands.base_velocity.goal_vel_visualizer_cfg.markers["arrow"].scale == (1.5, 0.45, 0.45)
     assert env_cfg.events.reset_base.params["pose_range"]["x"] == (0.0, 0.0)
     assert env_cfg.events.reset_base.params["pose_range"]["y"] == (0.0, 0.0)
+    assert env_cfg.curriculum.terrain_levels is None
     assert env_cfg.terminations.time_out is None
     assert env_cfg.terminations.terrain_out_bound is None
     assert env_cfg.terminations.base_contact is None
     assert env_cfg.terminations.root_height is None
+
+
+def test_apply_play_runtime_overrides_treats_keyboard_control_like_center_spawn():
+    module = load_module()
+    env_cfg = make_fake_env_cfg()
+    options = SimpleNamespace(
+        disable_auto_reset=False,
+        show_depth_window=False,
+        show_depth_coverage=False,
+        show_command_arrow=False,
+        center_spawn=False,
+        keyboard_control=True,
+    )
+
+    module.apply_play_runtime_overrides(env_cfg, options)
+
+    assert env_cfg.events.reset_base.params["pose_range"]["x"] == (0.0, 0.0)
+    assert env_cfg.events.reset_base.params["pose_range"]["y"] == (0.0, 0.0)
+    assert env_cfg.curriculum.terrain_levels is None
 
 
 def test_build_default_tracking_camera_specs_returns_three_named_views():
@@ -315,7 +336,7 @@ def test_select_map_center_xy_prefers_geometric_middle():
     assert center_xy.tolist() == [0.0, -24.0]
 
 
-def test_select_center_terrain_origin_uses_map_center_xy_with_nearest_height():
+def test_select_center_terrain_origin_returns_nearest_actual_origin_to_map_center():
     module = load_module()
     terrain_origins = np.array(
         [
@@ -329,7 +350,8 @@ def test_select_center_terrain_origin_uses_map_center_xy_with_nearest_height():
 
     center_origin = module.select_center_terrain_origin(terrain_origins)
 
-    np.testing.assert_allclose(center_origin, np.array([0.0, -24.0, -0.82], dtype=np.float32))
+    np.testing.assert_allclose(center_origin, np.array([-4.0, -28.0, -0.82], dtype=np.float32))
+    assert any(np.allclose(center_origin, origin) for origin in terrain_origins.reshape(-1, 3))
 
 
 def test_apply_play_runtime_overrides_disables_built_in_depth_history_debug_window():
