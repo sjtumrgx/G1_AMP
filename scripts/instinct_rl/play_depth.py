@@ -13,13 +13,17 @@ sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab"
 from isaaclab.app import AppLauncher
 from play_runtime import (
     add_play_runtime_args,
-    apply_play_runtime_overrides,
+    build_play_video_output_path,
     build_default_tracking_camera_specs,
     compose_recording_frame,
     compute_tracking_camera_views,
     create_keyboard_event_subscription,
     ensure_sensor_initialized,
     normalize_depth_frame_for_display,
+    prepare_play_env_cfg,
+    resolve_recording_camera_resolution,
+    resolve_interactive_rendering_gpu_override,
+    resolve_play_seed,
     resolve_video_capture_settings,
     select_center_terrain_origin,
     validate_isaacsim_python_environment,
@@ -38,6 +42,7 @@ parser.add_argument(
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--exportonnx", action="store_true", default=False, help="Export policy as ONNX model.")
 parser.add_argument("--useonnx", action="store_true", default=False, help="Use the exported ONNX model for inference.")
 parser.add_argument("--debug", action="store_true", default=False, help="Enable debug mode.")
@@ -58,12 +63,46 @@ cli_args.add_instinct_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 validate_isaacsim_python_environment()
+
+
+class DisplayAwareAppLauncher(AppLauncher):
+    def __init__(self, launcher_args=None, *, active_gpu_override: int | None = None, **kwargs):
+        self._active_gpu_override = active_gpu_override
+        super().__init__(launcher_args, **kwargs)
+
+    def _resolve_device_settings(self, launcher_args: dict):
+        super()._resolve_device_settings(launcher_args)
+        if self._active_gpu_override is None:
+            return
+        if "cuda" not in launcher_args.get("device", ""):
+            return
+        launcher_args["active_gpu"] = int(self._active_gpu_override)
+        print(
+            "[INFO][AppLauncher]: Using rendering GPU:"
+            f" cuda:{self._active_gpu_override} while simulation tensors remain on"
+            f" {launcher_args.get('device', f'cuda:{self.device_id}')}"
+        )
+
+
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+# Force single-GPU rendering for play/replay. This avoids Isaac Sim mGPU P2P startup failures
+# on systems where multi-GPU peer access probing is unstable or already pre-configured.
+args_cli.multi_gpu = False
+rendering_gpu_override = resolve_interactive_rendering_gpu_override(
+    args_cli.device,
+    headless=args_cli.headless,
+)
+if rendering_gpu_override is not None:
+    print(
+        "[INFO] Interactive X11 display is active on GPU"
+        f" {rendering_gpu_override}; rendering will use cuda:{rendering_gpu_override}"
+        f" while simulation tensors stay on {args_cli.device}."
+    )
 
 # launch omniverse app
-app_launcher = AppLauncher(args_cli)
+app_launcher = DisplayAwareAppLauncher(args_cli, active_gpu_override=rendering_gpu_override)
 simulation_app = app_launcher.app
 
 """Rest everything follows."""
@@ -74,7 +113,6 @@ import numpy as np
 import torch
 
 import carb.input
-import omni.appwindow
 import cv2
 from carb.input import KeyboardEventType
 from instinct_rl.runners import OnPolicyRunner
@@ -91,6 +129,13 @@ from instinctlab.tasks.parkour.scripts.keyboard_commands import (
     resolve_keyboard_command_limits,
 )
 from instinctlab.tasks.parkour.scripts.config_loading import load_logged_config
+from instinctlab.tasks.parkour.scripts.play_route import (
+    RouteWaypointFollower,
+    RouteWaypointRecorder,
+    build_tile_wall_edges_grid,
+    load_route_artifact,
+    save_route_artifact,
+)
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
 from instinctlab.utils.wrappers.instinct_rl import InstinctRlOnPolicyRunnerCfg
 
@@ -110,6 +155,13 @@ if args_cli.debug:
 def _quat_wxyz_to_yaw(quat_wxyz: np.ndarray) -> float:
     w, x, y, z = np.asarray(quat_wxyz, dtype=np.float32)
     return float(np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)))
+
+
+def _read_root_state(env) -> tuple[np.ndarray, float]:
+    robot = env.unwrapped.scene["robot"]
+    root_position = robot.data.root_pos_w[0].detach().cpu().numpy()
+    root_quat = robot.data.root_quat_w[0].detach().cpu().numpy()
+    return root_position, _quat_wxyz_to_yaw(root_quat)
 
 
 def _pin_first_env_to_center_origin(env) -> bool:
@@ -192,7 +244,7 @@ class PlayCaptureRig:
         self._depth_window_disabled = False
         self._camera_specs = build_default_tracking_camera_specs() if output_path is not None else []
         self._cameras: dict[str, Camera] = {}
-        self._camera_resolution = (640, 360)
+        self._camera_resolution = resolve_recording_camera_resolution(video_layout)
         self._camera_warmup_frames = 5
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -205,7 +257,7 @@ class PlayCaptureRig:
 
     @property
     def is_complete(self) -> bool:
-        return self.output_path is not None and self.frames_written >= self.video_max_frames
+        return self.output_path is not None and self.video_max_frames is not None and self.frames_written >= self.video_max_frames
 
     def capture(self, timestep: int) -> None:
         depth_panel = _read_depth_panel(self.env, self.env_cfg)
@@ -320,6 +372,8 @@ def main():
     keyboard_subscription = None
     video_output_path = None
     interrupted = False
+    route_artifact = None
+    route_recorder = None
     # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
@@ -349,18 +403,33 @@ def main():
         log_dir = os.path.join(log_root_path, agent_cfg.run_name + "_play")
         resume_path = "model_scratch.pt"
 
+    if args_cli.replay_route is not None:
+        route_artifact = load_route_artifact(args_cli.replay_route)
+        if route_artifact.task is not None and route_artifact.task != args_cli.task:
+            raise ValueError(
+                f"Route task mismatch: route was recorded for {route_artifact.task},"
+                f" but current task is {args_cli.task}."
+            )
+    if args_cli.keyboard_control and route_artifact is not None:
+        raise ValueError("--keyboard_control cannot be combined with --replay_route.")
+
     if args_cli.env_cfg:
         env_cfg = load_logged_config(log_dir, "env")
+    play_seed = resolve_play_seed(
+        cli_seed=args_cli.seed,
+        route_seed=route_artifact.seed if route_artifact is not None else None,
+        agent_seed=getattr(agent_cfg, "seed", None),
+    )
+    if play_seed is not None:
+        agent_cfg.seed = play_seed
+        print(f"[INFO] Using play seed: {play_seed}")
+    prepare_play_env_cfg(env_cfg, args_cli, seed=play_seed, route_artifact=route_artifact)
     if args_cli.agent_cfg:
         agent_cfg_dict = load_logged_config(log_dir, "agent")
+        if isinstance(agent_cfg_dict, dict) and play_seed is not None:
+            agent_cfg_dict["seed"] = play_seed
     else:
         agent_cfg_dict = agent_cfg.to_dict()
-
-    apply_play_runtime_overrides(env_cfg, args_cli)
-
-    if args_cli.keyboard_control:
-        env_cfg.scene.num_envs = 1
-        env_cfg.episode_length_s = 1e10
 
     try:
         # create isaac environment
@@ -433,7 +502,8 @@ def main():
         command_obs_slice = get_obs_slice(env.get_obs_segments(), "velocity_commands")
         keyboard_history_length = command_obs_slice[1][0] // 3
         keyboard_controller = None
-        if args_cli.keyboard_control:
+        route_follower = None
+        if args_cli.keyboard_control or route_artifact is not None:
             keyboard_controller = ParkourKeyboardCommandController(
                 num_envs=env.num_envs,
                 history_length=keyboard_history_length,
@@ -441,6 +511,18 @@ def main():
                 limits=resolve_keyboard_command_limits(env_cfg),
                 linvel_step=args_cli.keyboard_linvel_step,
                 angvel=args_cli.keyboard_angvel,
+            )
+        if route_artifact is not None:
+            route_follower = RouteWaypointFollower(
+                waypoints_xy=route_artifact.waypoints_xy,
+                limits=resolve_keyboard_command_limits(env_cfg),
+                lookahead_distance_m=args_cli.route_lookahead_m,
+                goal_tolerance_m=args_cli.route_goal_tolerance_m,
+                cruise_speed=args_cli.route_cruise_speed,
+            )
+            print(
+                f"[INFO] Loaded route replay from {args_cli.replay_route}"
+                f" with {len(route_artifact.waypoints_xy)} waypoints."
             )
 
         def on_keyboard_input(e):
@@ -462,7 +544,7 @@ def main():
         if args_cli.keyboard_control:
             keyboard_subscription = create_keyboard_event_subscription(on_keyboard_input)
 
-        if args_cli.center_spawn or args_cli.keyboard_control:
+        if args_cli.center_spawn or args_cli.keyboard_control or route_artifact is not None:
             if _pin_first_env_to_center_origin(env.unwrapped):
                 obs, _ = env.reset()
             else:
@@ -470,15 +552,37 @@ def main():
         else:
             obs, _ = env.get_observations()
 
+        if args_cli.save_route is not None:
+            terrain_generator_cfg = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
+            saved_tile_wall_edges = None
+            if terrain_generator_cfg is not None:
+                num_rows = int(getattr(terrain_generator_cfg, "num_rows"))
+                num_cols = int(getattr(terrain_generator_cfg, "num_cols"))
+                subterrain_specific_cfgs = getattr(env.unwrapped.scene.terrain, "subterrain_specific_cfgs", None)
+                saved_tile_wall_edges = build_tile_wall_edges_grid(
+                    subterrain_specific_cfgs=subterrain_specific_cfgs,
+                    num_rows=num_rows,
+                    num_cols=num_cols,
+                )
+            route_recorder = RouteWaypointRecorder(
+                task=args_cli.task,
+                seed=play_seed,
+                step_dt=float(env.unwrapped.step_dt),
+                waypoint_spacing_m=args_cli.route_interval_m,
+                tile_wall_edges=saved_tile_wall_edges,
+            )
+            root_position, _ = _read_root_state(env)
+            route_recorder.record_position(root_position)
+
         if args_cli.show_depth_coverage:
             _log_depth_input_design(env_cfg)
 
         if args_cli.video:
-            video_output_path = os.path.join(
-                log_dir,
-                "videos",
-                "play",
-                f"model_{resume_path.split('_')[-1].split('.')[0]}-step-{args_cli.video_start_step}.mp4",
+            video_output_path = build_play_video_output_path(
+                log_dir=log_dir,
+                resume_path=resume_path,
+                video_start_step=args_cli.video_start_step,
+                replay_route_path=args_cli.replay_route,
             )
         capture_settings = resolve_video_capture_settings(
             video_length=args_cli.video_length,
@@ -486,6 +590,7 @@ def main():
             step_dt=float(env.unwrapped.step_dt),
             video_frame_stride=args_cli.video_frame_stride,
             video_fps=args_cli.video_fps,
+            replay_route_active=route_artifact is not None,
         )
         capture_rig = PlayCaptureRig(
             env=env,
@@ -505,7 +610,11 @@ def main():
             # run everything in inference mode
             with torch.inference_mode():
                 # agent stepping
-                if args_cli.keyboard_control:
+                if route_follower is not None:
+                    root_position, root_yaw = _read_root_state(env)
+                    replay_command = route_follower.compute_command(position_xy=root_position[:2], yaw=root_yaw)
+                    keyboard_controller.set_command(replay_command)
+                if args_cli.keyboard_control or route_follower is not None:
                     obs[:, command_obs_slice[0]] = keyboard_controller.build_observation()
                 actions = policy(obs)
                 if args_cli.useonnx:
@@ -522,9 +631,12 @@ def main():
                 # env stepping
                 obs, rewards, dones, infos = env.step(actions)
             timestep += 1
+            if route_recorder is not None:
+                root_position, _ = _read_root_state(env)
+                route_recorder.record_position(root_position)
             capture_rig.capture(timestep)
 
-            if capture_rig.is_complete:
+            if capture_rig.is_complete or (route_follower is not None and route_follower.is_complete):
                 break
     except KeyboardInterrupt:
         interrupted = True
@@ -532,6 +644,12 @@ def main():
     finally:
         if keyboard_subscription is not None:
             keyboard_subscription.close()
+        if route_recorder is not None:
+            if env is not None:
+                root_position, _ = _read_root_state(env)
+                route_recorder.record_position(root_position)
+            route_path = save_route_artifact(args_cli.save_route, route_recorder.build_artifact())
+            print(f"[INFO] Saved route artifact to {route_path}")
         if capture_rig is not None:
             capture_rig.close()
         if env is not None:

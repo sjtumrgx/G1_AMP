@@ -1,6 +1,10 @@
 import argparse
+from datetime import datetime
 import math
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import subprocess
 from typing import Iterable
 
 import cv2
@@ -22,7 +26,7 @@ class TrackingCameraSpec:
 
 @dataclass(frozen=True)
 class VideoCaptureSettings:
-    max_frames: int
+    max_frames: int | None
     video_fps: float
     frame_stride: int
 
@@ -92,6 +96,42 @@ def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         default=1,
         help="Capture one video frame every N simulation steps to reduce recording overhead.",
     )
+    parser.add_argument(
+        "--save_route",
+        type=str,
+        default=None,
+        help="Optional JSON output path for saving the executed route as world-frame waypoints.",
+    )
+    parser.add_argument(
+        "--replay_route",
+        type=str,
+        default=None,
+        help="Optional JSON route artifact to replay in headless or interactive runs.",
+    )
+    parser.add_argument(
+        "--route_interval_m",
+        type=float,
+        default=0.15,
+        help="Minimum XY spacing, in meters, between saved route waypoints.",
+    )
+    parser.add_argument(
+        "--route_lookahead_m",
+        type=float,
+        default=0.6,
+        help="Lookahead distance, in meters, used by route replay.",
+    )
+    parser.add_argument(
+        "--route_goal_tolerance_m",
+        type=float,
+        default=0.2,
+        help="Distance threshold, in meters, for advancing or finishing route waypoints.",
+    )
+    parser.add_argument(
+        "--route_cruise_speed",
+        type=float,
+        default=None,
+        help="Forward speed used during route replay. Defaults to the command limit maximum.",
+    )
     return parser
 
 
@@ -103,6 +143,30 @@ def validate_isaacsim_python_environment(numpy_version: str | None = None) -> No
             f" {current_numpy_version}, but Isaac Sim 5.1 / isaacsim-kernel requires numpy=={ISAACSIM_REQUIRED_NUMPY_VERSION}."
             " Downgrade numpy in this environment before launching play.py."
         )
+
+
+def resolve_interactive_rendering_gpu_override(
+    device: str,
+    *,
+    headless: bool,
+    display: str | None = None,
+    command_runner=subprocess.run,
+) -> int | None:
+    if headless or not device.startswith("cuda"):
+        return None
+
+    active_display = display if display is not None else os.environ.get("DISPLAY")
+    if not active_display:
+        return None
+
+    display_gpu_index = _discover_single_display_active_gpu(command_runner=command_runner)
+    if display_gpu_index is None:
+        return None
+
+    device_gpu_index = _extract_cuda_device_index(device)
+    if device_gpu_index is None or device_gpu_index != 0 or device_gpu_index == display_gpu_index:
+        return None
+    return display_gpu_index
 
 
 def create_keyboard_event_subscription(callback, app_window=None, input_interface=None) -> KeyboardEventSubscription:
@@ -153,7 +217,7 @@ def select_center_terrain_origin(terrain_origins) -> np.ndarray:
 
 
 def apply_play_runtime_overrides(env_cfg, options) -> None:
-    if getattr(options, "disable_auto_reset", False):
+    if _should_disable_auto_reset(options):
         env_cfg.episode_length_s = NO_AUTO_RESET_EPISODE_LENGTH_S
         for term_name in vars(env_cfg.terminations):
             setattr(env_cfg.terminations, term_name, None)
@@ -173,12 +237,60 @@ def apply_play_runtime_overrides(env_cfg, options) -> None:
     _configure_command_arrow_visuals(env_cfg, enabled=getattr(options, "show_command_arrow", False))
 
 
+def resolve_play_seed(*, cli_seed: int | None, route_seed: int | None, agent_seed: int | None) -> int | None:
+    if cli_seed is not None:
+        return int(cli_seed)
+    if route_seed is not None:
+        return int(route_seed)
+    if agent_seed is not None:
+        return int(agent_seed)
+    return None
+
+
+def _apply_terrain_generator_seed(env_cfg, seed: int | None) -> None:
+    if seed is None:
+        return
+    terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+    terrain_generator = getattr(terrain, "terrain_generator", None)
+    if terrain_generator is not None:
+        terrain_generator.seed = int(seed)
+
+
+def _apply_route_artifact_terrain_layout(env_cfg, route_artifact) -> None:
+    if route_artifact is None:
+        return
+    terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+    terrain_generator = getattr(terrain, "terrain_generator", None)
+    if terrain_generator is None:
+        return
+    tile_wall_edges = getattr(route_artifact, "tile_wall_edges", None)
+    if tile_wall_edges is not None:
+        terrain_generator.precomputed_tile_wall_edges = tile_wall_edges
+
+
+def prepare_play_env_cfg(env_cfg, options, *, seed: int | None = None, route_artifact=None) -> None:
+    if seed is not None:
+        env_cfg.seed = int(seed)
+    _apply_terrain_generator_seed(env_cfg, seed)
+    _apply_route_artifact_terrain_layout(env_cfg, route_artifact)
+    if _should_use_single_env_play(options):
+        env_cfg.scene.num_envs = 1
+        env_cfg.episode_length_s = NO_AUTO_RESET_EPISODE_LENGTH_S
+    apply_play_runtime_overrides(env_cfg, options)
+
+
 def build_default_tracking_camera_specs() -> list[TrackingCameraSpec]:
     return [
         TrackingCameraSpec("hero", eye_offset=(-4.0, -1.5, 1.8), target_offset=(1.0, 0.0, 0.9)),
         TrackingCameraSpec("side", eye_offset=(0.0, -4.5, 1.6), target_offset=(0.7, 0.0, 0.9)),
         TrackingCameraSpec("overview", eye_offset=(-1.0, 0.0, 5.5), target_offset=(1.0, 0.0, 0.7)),
     ]
+
+
+def resolve_recording_camera_resolution(video_layout: str) -> tuple[int, int]:
+    if video_layout == "single":
+        return (2560, 1440)
+    return (1280, 720)
 
 
 def compute_tracking_camera_views(
@@ -254,13 +366,16 @@ def resolve_video_capture_settings(
     step_dt: float,
     video_frame_stride: int,
     video_fps: float | None,
+    replay_route_active: bool = False,
 ) -> VideoCaptureSettings:
     frame_stride = max(1, int(video_frame_stride))
     default_video_fps = 1.0 / (step_dt * frame_stride)
     resolved_video_fps = default_video_fps if video_fps is None else float(video_fps)
     if resolved_video_fps <= 0.0:
         raise ValueError(f"video_fps must be positive, got {resolved_video_fps}.")
-    if video_duration_s is None:
+    if replay_route_active and video_duration_s is None:
+        max_frames = None
+    elif video_duration_s is None:
         max_frames = max(1, int(video_length))
     else:
         max_frames = max(1, int(math.ceil(video_duration_s * resolved_video_fps)))
@@ -269,6 +384,79 @@ def resolve_video_capture_settings(
         video_fps=resolved_video_fps,
         frame_stride=frame_stride,
     )
+
+
+def build_play_video_output_path(
+    *,
+    log_dir: str | Path,
+    resume_path: str | Path,
+    video_start_step: int,
+    replay_route_path: str | Path | None = None,
+    timestamp: datetime | None = None,
+) -> str:
+    log_dir_path = Path(log_dir)
+    resume_path_str = str(resume_path)
+    model_token = Path(resume_path_str).stem.split("_")[-1]
+    file_stem = f"model_{model_token}-step-{int(video_start_step)}"
+    if replay_route_path is not None:
+        file_stem += f"-{Path(replay_route_path).stem}"
+    resolved_timestamp = datetime.now() if timestamp is None else timestamp
+    file_stem += f"-{resolved_timestamp.strftime('%Y%m%d_%H%M%S')}"
+    return str(log_dir_path / "videos" / "play" / f"{file_stem}.mp4")
+
+
+def _discover_single_display_active_gpu(*, command_runner) -> int | None:
+    try:
+        result = command_runner(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,display_active",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    enabled_gpu_indices = _parse_display_active_gpu_indices(result.stdout)
+    if len(enabled_gpu_indices) != 1:
+        return None
+    return enabled_gpu_indices[0]
+
+
+def _extract_cuda_device_index(device: str) -> int | None:
+    if device == "cuda":
+        return 0
+    if device.startswith("cuda:"):
+        try:
+            return int(device.split(":", maxsplit=1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _parse_display_active_gpu_indices(raw_output: str) -> list[int]:
+    enabled_gpu_indices: list[int] = []
+    for line in raw_output.splitlines():
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        index_and_state = [part.strip() for part in stripped_line.split(",", maxsplit=1)]
+        if len(index_and_state) != 2:
+            continue
+        gpu_index_str, display_state = index_and_state
+        try:
+            gpu_index = int(gpu_index_str)
+        except ValueError:
+            continue
+        if display_state.lower() == "enabled":
+            enabled_gpu_indices.append(gpu_index)
+    return enabled_gpu_indices
 
 
 def _set_depth_debug_vis(observation_group, enabled: bool) -> None:
@@ -306,8 +494,13 @@ def _lock_center_spawn_pose(env_cfg) -> None:
     pose_range = events.reset_base.params.get("pose_range")
     if pose_range is None:
         return
-    for axis in ("x", "y"):
+    for axis in ("x", "y", "yaw"):
         pose_range[axis] = (0.0, 0.0)
+    velocity_range = events.reset_base.params.get("velocity_range")
+    if velocity_range is None:
+        return
+    for axis in tuple(velocity_range.keys()):
+        velocity_range[axis] = (0.0, 0.0)
 
 
 def _disable_terrain_curriculum(env_cfg) -> None:
@@ -323,7 +516,19 @@ def _disable_terrain_curriculum(env_cfg) -> None:
 
 
 def _should_enforce_center_spawn(options) -> bool:
-    return bool(getattr(options, "center_spawn", False) or getattr(options, "keyboard_control", False))
+    return bool(
+        getattr(options, "center_spawn", False)
+        or getattr(options, "keyboard_control", False)
+        or getattr(options, "replay_route", None)
+    )
+
+
+def _should_disable_auto_reset(options) -> bool:
+    return bool(getattr(options, "disable_auto_reset", False) or getattr(options, "replay_route", None))
+
+
+def _should_use_single_env_play(options) -> bool:
+    return bool(getattr(options, "keyboard_control", False) or getattr(options, "replay_route", None))
 
 
 def _ensure_rgb_uint8(frame) -> np.ndarray:
