@@ -67,6 +67,14 @@ class ParkourKeyboardCommandController:
     def zero_all(self) -> None:
         self.command.zero_()
 
+    def set_command(self, command) -> None:
+        command_tensor = torch.as_tensor(command, device=self.device, dtype=self.command.dtype).reshape(-1, 3)
+        if command_tensor.shape[0] == 1 and self.num_envs != 1:
+            command_tensor = command_tensor.expand(self.num_envs, -1)
+        if command_tensor.shape[0] != self.num_envs:
+            raise ValueError(f"Expected {self.num_envs} command rows, got {command_tensor.shape[0]}.")
+        self.command.copy_(command_tensor)
+
     def build_observation(self) -> torch.Tensor:
         self.history = torch.roll(self.history, shifts=-1, dims=1)
         self.history[:, -1] = self.command
