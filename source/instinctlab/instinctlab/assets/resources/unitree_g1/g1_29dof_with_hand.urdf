@@ -1,14 +1,4 @@
 <robot name="g1_29dof_with_hand">
-  <mujoco>
-    <compiler meshdir="meshes" discardvisual="false"/>
-  </mujoco>
-
-  <!-- [CAUTION] uncomment when convert to mujoco -->
-  <!-- <link name="world"></link>
-  <joint name="floating_base_joint" type="floating">
-    <parent link="world"/>
-    <child link="pelvis"/>
-  </joint> -->
 
   <link name="pelvis">
     <inertial>

@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 
-sys.path.append(os.path.join(os.getcwd(), "scripts", "instinct_rl"))
 sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab", "tasks", "parkour", "scripts"))
 
 from isaaclab.app import AppLauncher
@@ -35,7 +34,6 @@ from play_runtime import (
     validate_isaacsim_python_environment,
 )
 
-# local imports
 import cli_args  # isort: skip
 
 # add argparse arguments

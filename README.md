@@ -201,6 +201,55 @@ Most public tasks in this repository are not zero-data entry points. Before trai
   File: `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py`
   Set `AmassMotionCfg.path` and `filtered_motion_selection_filepath`.
 
+The `scripts/instinct_rl` directory is intentionally kept to user-facing entry scripts and standalone utilities.
+Task-specific helper modules now live under `source/instinctlab/instinctlab/tasks/.../scripts` or other source
+packages instead of being mixed into the script directory.
+
+### Optional: BeyondMimic Motion Preprocessing and W&B Export Workflow
+
+If your source motions are still in the Unitree-style generalized-coordinate `.csv` format, you can preprocess them
+inside this repository and optionally publish the exported motion bundle to W&B Registry. This is adapted from the
+`Motion Preprocessing & Registry Setup` flow in `whole_body_tracking`, but aligned with `instinctlab`'s local
+`*_retargeted.npz` training path.
+
+- Gather retargeted reference motions and respect the original dataset licenses. The expected CSV convention is the same
+  generalized-coordinate layout used by Unitree-style retargeted motion datasets.
+- Convert a CSV motion with:
+
+```bash
+python scripts/instinct_rl/csv_to_npz.py \
+    --input_file /path/to/{motion_name}.csv \
+    --input_fps 30 \
+    --output_name {motion_name} \
+    --output_dir /path/to/motion_outputs \
+    --headless
+```
+
+This writes two local files:
+
+- `{motion_name}_retargeted.npz`: compatible with `AmassMotionCfg.path` in this repository
+- `{motion_name}_motion.npz`: full-body motion export for downstream inspection, interchange, and optional W&B upload
+
+The preprocessing script uploads to W&B by default. To keep the workflow local-only, add `--skip_registry_upload`.
+
+- If you want the W&B registry flow, log in first and ensure the registry path is under your intended entity.
+- This repository no longer ships a dedicated motion-replay entry script. Treat `{motion_name}_motion.npz` as an
+  export artifact for downstream tooling, ad hoc analysis, or registry archival rather than an in-repo playback format.
+
+- To train `Instinct-BeyondMimic-Plane-G1-v0` or `Instinct-Shadowing-WholeBody-Plane-G1-v0`, point the task config to
+  the local `{motion_name}_retargeted.npz` file, not to the W&B registry artifact. Set `AmassMotionCfg.path` (or
+  `_path_`) to `/path/to/motion_outputs` and select `{motion_name}_retargeted.npz` in the corresponding config file.
+- For terrain-matched perceptive datasets, keep using local folders plus `metadata.yaml`. If needed, generate the YAML
+  with `python scripts/motion_matched_metadata_generator.py --path /path/to/dataset_dir`.
+
+Debugging notes:
+
+- If you are uploading to an organization-scoped registry, export `WANDB_ENTITY` to the organization name or pass
+  `--wandb_entity`.
+- If the default temporary directory is unavailable, pass `--temp_dir /path/to/tmpdir`.
+- The current `scripts/instinct_rl/train.py` flow is local-file based; registry upload is optional for sharing and
+  archival, not a required training dependency.
+
 If task imports succeed but rollouts fail immediately, separate platform problems from task-data problems:
 
 - Platform problems show up as Isaac Sim, Isaac Lab, Vulkan, CUDA, import, or environment bootstrap failures.
@@ -559,18 +608,8 @@ python scripts/instinct_rl/edit_route_map.py \
 python scripts/instinct_rl/play_depth.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name> --exportonnx --useonnx
 ```
 
-5. Validate the exported ONNX policy in MuJoCo:
-
-```bash
-pip install mujoco
-python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --headless --depth-mode=zeros --sim_duration=2.0
-```
-
-6. Run the MuJoCo viewer with keyboard override:
-
-```bash
-python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --keyboard_control --depth-mode=mujoco
-```
+The ONNX export under the run's `exported/` directory is the handoff artifact for downstream deployment or external
+runtime validation. This repository no longer includes a MuJoCo-based sim2sim validation path.
 
 ### Common Options
 
@@ -584,23 +623,6 @@ python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --keyboard_contr
 - `--video`: Record playback videos.
 - `--exportonnx`: Export the trained model to ONNX for onboard deployment.
 - `--useonnx`: Use the ONNX model for inference during play.
-
-### MuJoCo Sim2Sim Notes
-
-- `scripts/instinct_rl/play_mujoco.py` defaults to the logged parkour URDF, promotes it to a floating-base MuJoCo model, and injects a flat floor plus a head camera at runtime.
-- `--depth-mode=zeros` is the debug or bring-up path. It is useful for validating the MuJoCo loop, PD control, and ONNX inference chain before relying on rendered depth.
-- `--depth-mode=mujoco` uses an approximate MuJoCo depth pipeline. It is suitable for early sim2sim checks, but it does not yet claim pixel-level parity with the IsaacLab ray-caster camera and noise pipeline.
-- Keyboard controls currently mirror the IsaacLab play script:
-  - `W`: increase forward command
-  - `F`: set positive yaw command
-  - `G`: set negative yaw command
-  - `S`: reset yaw command to zero
-  - `X`: zero all commands
-- The MuJoCo path records optional traces through `--record_npz=<path>` for offline comparison.
-- Fidelity gaps still remain:
-  - the MuJoCo scene is a flat plane, not the full Isaac parkour terrain generator
-  - the depth preprocessing is approximate
-  - explicit XML overrides passed with `--mjcf` must already contain compatible joints and, if needed, their own camera setup
 
 ### Set up IDE (Optional)
 

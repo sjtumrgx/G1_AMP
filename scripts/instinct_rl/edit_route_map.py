@@ -12,7 +12,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-sys.path.append(os.path.join(os.getcwd(), "scripts", "instinct_rl"))
 sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab"))
 sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab", "tasks", "parkour", "scripts"))
 

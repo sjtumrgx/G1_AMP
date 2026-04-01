@@ -2,9 +2,10 @@
 
 ## Basic Usage Guidelines
 
-### Parkour Task
-
 **Task ID:** `Instinct-Parkour-Target-Amp-G1-v0`
+
+User-facing parkour entry scripts live in `scripts/instinct_rl`. Parkour-specific helper modules now live under
+`source/instinctlab/instinctlab/tasks/parkour/scripts`.
 
 1. Go to `config/g1/g1_parkour_target_amp_cfg.py` and set the `path` and `filtered_motion_selection_filepath` in `AmassMotionCfg` to the reference motion you want to use.
 
@@ -153,45 +154,18 @@ python scripts/instinct_rl/edit_route_map.py \
 python scripts/instinct_rl/play_depth.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name> --exportonnx --useonnx
 ```
 
-5. Validate the exported ONNX policy in MuJoCo:
-
-```bash
-pip install mujoco
-python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --headless --depth-mode=zeros --sim_duration=2.0
-```
-
-6. Run the MuJoCo viewer with keyboard override:
-
-```bash
-python scripts/instinct_rl/play_mujoco.py --load_run=<run_name> --keyboard_control --depth-mode=mujoco
-```
+The exported ONNX model under the run's `exported/` directory is intended for downstream deployment or external runtime
+validation. This repository no longer carries a MuJoCo-based sim2sim bridge.
 
 ## Common Options
 
 - `--num_envs`: Number of parallel environments (default varies by task)
-- `--keyboard_control`: Enable keyboard control during playing
+- `--keyboard_control`: Enable keyboard control during play
 - `--seed`: Seed the terrain and reset randomization for deterministic play
-- `--load_run`: Run name to load checkpoint from for playing
+- `--load_run`: Run name to load checkpoint from for play
 - `--save_route`: Save the executed route as a JSON artifact
 - `--replay_route`: Load a saved route and follow it automatically
 - `edit_route_map.py`: Export a fixed-seed top-down terrain map and click waypoints into a compatible `route.json`
 - `--video`: Record training/playback videos
-- `--exportonnx`: Export the trained model to ONNX format for onboard deployment during playing
-- `--useonnx`: Use the ONNX model for inference during playing (requires `--exportonnx`)
-
-## MuJoCo Sim2Sim Notes
-
-- `scripts/instinct_rl/play_mujoco.py` defaults to the logged parkour URDF, promotes it to a floating-base MuJoCo model, and injects a flat floor plus a head camera at runtime.
-- `--depth-mode=zeros` is the debug / bring-up path. It is useful for validating the MuJoCo loop, PD control, and ONNX inference chain before relying on rendered depth.
-- `--depth-mode=mujoco` uses an approximate MuJoCo depth pipeline. It is suitable for early sim2sim checks, but it does not yet claim pixel-level parity with the IsaacLab ray-caster camera and noise pipeline.
-- Keyboard controls currently mirror the IsaacLab play script:
-  - `W`: increase forward command
-  - `F`: set positive yaw command
-  - `G`: set negative yaw command
-  - `S`: reset yaw command to zero
-  - `X`: zero all commands
-- The MuJoCo path records optional traces through `--record_npz=<path>` for offline comparison.
-- Fidelity gaps still remain:
-  - the MuJoCo scene is a flat plane, not the full Isaac parkour terrain generator
-  - the depth preprocessing is approximate
-  - explicit XML overrides passed with `--mjcf` must already contain compatible joints and, if needed, their own camera setup
+- `--exportonnx`: Export the trained model to ONNX format for onboard deployment during play
+- `--useonnx`: Use the ONNX model for inference during play (requires `--exportonnx`)
