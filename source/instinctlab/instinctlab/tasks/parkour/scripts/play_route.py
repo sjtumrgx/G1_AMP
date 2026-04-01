@@ -95,6 +95,24 @@ def _load_module_from_path(module_name: str, module_path: Path) -> ModuleType:
     return module
 
 
+def _load_play_runtime_module() -> ModuleType:
+    try:
+        import instinctlab.tasks.parkour.scripts.play_runtime as play_runtime_module
+
+        return play_runtime_module
+    except ImportError:
+        return _load_module_from_path(
+            "parkour_play_runtime_compat",
+            Path(__file__).resolve().with_name("play_runtime.py"),
+        )
+
+
+_PLAY_RUNTIME_MODULE = _load_play_runtime_module()
+# Compatibility re-exports for play/replay entrypoints that still import these helpers here.
+compute_contact_overlay_state = _PLAY_RUNTIME_MODULE.compute_contact_overlay_state
+detect_new_contact_events = _PLAY_RUNTIME_MODULE.detect_new_contact_events
+
+
 def _ensure_offline_terrain_modules() -> dict[str, ModuleType]:
     global _OFFLINE_TERRAIN_MODULES
     if _OFFLINE_TERRAIN_MODULES is not None:
@@ -407,6 +425,64 @@ def load_route_artifact(path: str | Path) -> RouteArtifact:
         waypoints_xy=waypoints_xy,
         tile_wall_edges=normalize_tile_wall_edges(payload.get("tile_wall_edges")),
     )
+
+
+def build_route_overlay_points(
+    *,
+    waypoints_xy: list[list[float]] | list[tuple[float, float]],
+    z_height: float = 0.05,
+) -> list[tuple[float, float, float]]:
+    return [
+        (float(point[0]), float(point[1]), float(z_height))
+        for point in waypoints_xy
+    ]
+
+
+def build_line_strip_segments(
+    points: list[tuple[float, float, float]] | tuple[tuple[float, float, float], ...],
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]]]:
+    ordered_points = [tuple(map(float, point)) for point in points]
+    if len(ordered_points) < 2:
+        return [], []
+    return ordered_points[:-1], ordered_points[1:]
+
+
+def predict_future_trajectory_points(
+    *,
+    position_xy,
+    yaw: float,
+    command,
+    horizon_s: float = 1.0,
+    num_samples: int = 20,
+    z_height: float = 0.05,
+) -> list[tuple[float, float, float]]:
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive.")
+
+    position = np.asarray(position_xy, dtype=np.float64).reshape(2)
+    vx_body, vy_body, yaw_rate = np.asarray(command, dtype=np.float64).reshape(3)
+    step_dt = float(horizon_s) / float(num_samples)
+    current_yaw = float(yaw)
+    current_position = position.copy()
+    points: list[tuple[float, float, float]] = [
+        (float(current_position[0]), float(current_position[1]), float(z_height))
+    ]
+
+    for _ in range(int(num_samples)):
+        cos_yaw = math.cos(current_yaw)
+        sin_yaw = math.sin(current_yaw)
+        velocity_world = np.array(
+            [
+                cos_yaw * vx_body - sin_yaw * vy_body,
+                sin_yaw * vx_body + cos_yaw * vy_body,
+            ],
+            dtype=np.float64,
+        )
+        current_position = current_position + velocity_world * step_dt
+        current_yaw = current_yaw + float(yaw_rate) * step_dt
+        points.append((float(current_position[0]), float(current_position[1]), float(z_height)))
+
+    return points
 
 
 def _wrap_to_pi(angle: float) -> float:

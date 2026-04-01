@@ -1,6 +1,7 @@
 import copy
 import os
 
+import isaaclab.sim as sim_utils
 from isaaclab.envs import ViewerCfg
 from isaaclab.utils import configclass
 
@@ -13,7 +14,7 @@ from instinctlab.assets.unitree_g1 import (
     beyondmimic_g1_29dof_actuators,
     beyondmimic_g1_29dof_delayed_actuators,
 )
-from instinctlab.motion_reference import MotionReferenceManagerCfg
+from instinctlab.motion_reference import MotionReferenceManagerCfg, NoCollisionPropertiesCfg
 from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg as AmassMotionCfgBase
 from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 from instinctlab.sensors import get_link_prim_targets
@@ -23,6 +24,13 @@ __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 G1_CFG = copy.deepcopy(G1_29DOF_TORSOBASE_POPSICLE_CFG)
 G1_CFG.spawn.merge_fixed_joints = True
 G1_CFG.init_state.pos = (0.0, 0.0, 0.9)
+G1_REFERENCE_CFG = copy.deepcopy(G1_CFG)
+G1_REFERENCE_CFG.spawn.collision_props = NoCollisionPropertiesCfg()
+G1_REFERENCE_CFG.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
+    diffuse_color=(0.2, 0.95, 0.8),
+    opacity=0.2,
+)
+G1_REFERENCE_CFG.init_state.pos = (0.0, 0.0, -10.0)
 G1_with_shoe_CFG = copy.deepcopy(G1_CFG)
 G1_with_shoe_CFG.spawn.asset_path = os.path.abspath(
     f"{__file_dir__}/../../urdf/g1_29dof_torsoBase_popsicle_with_shoe.urdf"
@@ -75,6 +83,17 @@ motion_reference_cfg = MotionReferenceManagerCfg(
 )
 
 
+@configclass
+class ParkourPlayVisualizationCfg:
+    depth_window: bool = True
+    depth_coverage: bool = True
+    normals_panel: bool = True
+    route_overlay: bool = True
+    foot_contact_overlay: bool = True
+    ghost_reference: bool = True
+    obstacle_edges: bool = True
+
+
 ROUGH_TERRAINS_CFG_PLAY = copy.deepcopy(ROUGH_TERRAINS_CFG)
 for sub_terrain_name, sub_terrain_cfg in ROUGH_TERRAINS_CFG_PLAY.sub_terrains.items():
     sub_terrain_cfg.wall_prob = [0.0, 0.0, 0.0, 0.0]
@@ -88,9 +107,11 @@ class G1ParkourRoughEnvCfg(ParkourEnvCfg):
         # Scene
         self.scene.terrain.terrain_generator = ROUGH_TERRAINS_CFG
         self.scene.robot = G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+        self.scene.robot_reference = G1_REFERENCE_CFG.replace(prim_path="{ENV_REGEX_NS}/RobotReference")
         self.scene.robot.actuators = beyondmimic_g1_29dof_delayed_actuators
         self.scene.camera.mesh_prim_paths.extend(get_link_prim_targets(G1_29DOF_LINKS))
         self.scene.motion_reference = motion_reference_cfg
+        self.play_visualization = ParkourPlayVisualizationCfg()
 
 
 class ShoeConfigMixin:

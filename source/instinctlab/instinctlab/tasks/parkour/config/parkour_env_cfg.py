@@ -90,7 +90,7 @@ ROUGH_TERRAINS_CFG = FiledTerrainGeneratorCfg(
         ),
         "square_gaps": terrain_gen.PerlinSquareGapTerrainCfg(
             proportion=0.10,
-            gap_distance_range=(0.1, 0.7),
+            gap_distance_range=(0.1, 0.5),
             gap_depth=(0.4, 0.6),
             platform_width=2.5,
             border_width=1.0,
@@ -314,6 +314,7 @@ class SceneCfg(InteractiveSceneCfg):
     )
     # robots
     robot: ArticulationCfg = MISSING
+    robot_reference: ArticulationCfg = None
     # sensors
     left_height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",

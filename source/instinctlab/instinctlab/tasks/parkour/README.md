@@ -49,6 +49,26 @@ What this command does:
 - `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
 - `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
 
+Play-visualization config:
+
+- The centralized toggle block lives in `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py` as `ParkourPlayVisualizationCfg`.
+- The seven config booleans are:
+  - `depth_window`
+  - `depth_coverage`
+  - `normals_panel`
+  - `route_overlay`
+  - `foot_contact_overlay`
+  - `ghost_reference`
+  - `obstacle_edges`
+- CLI flags can override these defaults at runtime:
+  - `--show_depth_window`
+  - `--show_depth_coverage`
+  - `--normals_panel`
+  - `--route_overlay`
+  - `--foot_contact_overlay`
+  - `--ghost_reference`
+  - `--obstacle_edges`
+
 Notes:
 
 - The red coverage visualization shows the raw grouped ray-caster field of view. The policy depth observation is still a cropped lower-center patch after preprocessing.

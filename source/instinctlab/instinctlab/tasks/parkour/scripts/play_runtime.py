@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
-from typing import Iterable
+from typing import Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -15,6 +15,8 @@ from packaging.version import Version
 NO_AUTO_RESET_EPISODE_LENGTH_S = 1e10
 VIDEO_LAYOUT_CHOICES = ("quad", "single")
 ISAACSIM_REQUIRED_NUMPY_VERSION = "1.26.0"
+DEPTH_WINDOW_NAME = "parkour_depth"
+NORMALS_WINDOW_NAME = "parkour_normals"
 
 
 @dataclass(frozen=True)
@@ -29,6 +31,25 @@ class VideoCaptureSettings:
     max_frames: int | None
     video_fps: float
     frame_stride: int
+
+
+@dataclass(frozen=True)
+class PlayVisualizationConfig:
+    depth_window: bool = False
+    depth_coverage: bool = False
+    normals_panel: bool = False
+    route_overlay: bool = False
+    foot_contact_overlay: bool = False
+    ghost_reference: bool = False
+    obstacle_edges: bool = False
+
+
+@dataclass(frozen=True)
+class ContactOverlayState:
+    positions: np.ndarray
+    directions: np.ndarray
+    lengths: np.ndarray
+    active_mask: np.ndarray
 
 
 @dataclass
@@ -55,15 +76,45 @@ def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
     )
     parser.add_argument(
         "--show_depth_window",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Show the latest depth frame in a separate OpenCV window.",
     )
     parser.add_argument(
         "--show_depth_coverage",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Visualize depth ray hits in the RGB scene.",
+    )
+    parser.add_argument(
+        "--normals_panel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show a false-color normals panel derived from the ray-caster camera.",
+    )
+    parser.add_argument(
+        "--route_overlay",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show the replay route spline and a short future trajectory prediction overlay.",
+    )
+    parser.add_argument(
+        "--foot_contact_overlay",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show foot contact force arrows and touchdown markers.",
+    )
+    parser.add_argument(
+        "--ghost_reference",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show the motion-reference ghost overlay.",
+    )
+    parser.add_argument(
+        "--obstacle_edges",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Highlight obstacle and terrain edges with virtual cylinders.",
     )
     parser.add_argument(
         "--video_layout",
@@ -217,18 +268,28 @@ def select_center_terrain_origin(terrain_origins) -> np.ndarray:
 
 
 def apply_play_runtime_overrides(env_cfg, options) -> None:
+    visualization = _get_play_visualization_config(options)
+
     if _should_disable_auto_reset(options):
         env_cfg.episode_length_s = NO_AUTO_RESET_EPISODE_LENGTH_S
         for term_name in vars(env_cfg.terminations):
             setattr(env_cfg.terminations, term_name, None)
 
-    if getattr(options, "show_depth_window", False):
+    if visualization.depth_window:
         _set_depth_debug_vis(env_cfg.observations.policy, enabled=False)
         if hasattr(env_cfg.observations, "critic"):
             _set_depth_debug_vis(env_cfg.observations.critic, enabled=False)
 
-    if getattr(options, "show_depth_coverage", False):
+    if visualization.depth_coverage:
         env_cfg.scene.camera.debug_vis = True
+    if visualization.ghost_reference:
+        motion_reference = getattr(env_cfg.scene, "motion_reference", None)
+        if motion_reference is not None:
+            _configure_ghost_reference_preview(motion_reference)
+    if visualization.obstacle_edges:
+        terrain = getattr(env_cfg.scene, "terrain", None)
+        if terrain is not None:
+            terrain.debug_vis = True
 
     if _should_enforce_center_spawn(options):
         _lock_center_spawn_pose(env_cfg)
@@ -273,10 +334,45 @@ def prepare_play_env_cfg(env_cfg, options, *, seed: int | None = None, route_art
         env_cfg.seed = int(seed)
     _apply_terrain_generator_seed(env_cfg, seed)
     _apply_route_artifact_terrain_layout(env_cfg, route_artifact)
+    _apply_visualization_sensor_requirements(env_cfg, options)
     if _should_use_single_env_play(options):
         env_cfg.scene.num_envs = 1
         env_cfg.episode_length_s = NO_AUTO_RESET_EPISODE_LENGTH_S
     apply_play_runtime_overrides(env_cfg, options)
+
+
+def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConfig:
+    defaults = getattr(env_cfg, "play_visualization", None)
+    return PlayVisualizationConfig(
+        depth_window=_resolve_visualization_flag(
+            default=getattr(defaults, "depth_window", False),
+            override=getattr(options, "show_depth_window", None),
+        ),
+        depth_coverage=_resolve_visualization_flag(
+            default=getattr(defaults, "depth_coverage", False),
+            override=getattr(options, "show_depth_coverage", None),
+        ),
+        normals_panel=_resolve_visualization_flag(
+            default=getattr(defaults, "normals_panel", False),
+            override=getattr(options, "normals_panel", None),
+        ),
+        route_overlay=_resolve_visualization_flag(
+            default=getattr(defaults, "route_overlay", False),
+            override=getattr(options, "route_overlay", None),
+        ),
+        foot_contact_overlay=_resolve_visualization_flag(
+            default=getattr(defaults, "foot_contact_overlay", False),
+            override=getattr(options, "foot_contact_overlay", None),
+        ),
+        ghost_reference=_resolve_visualization_flag(
+            default=getattr(defaults, "ghost_reference", False),
+            override=getattr(options, "ghost_reference", None),
+        ),
+        obstacle_edges=_resolve_visualization_flag(
+            default=getattr(defaults, "obstacle_edges", False),
+            override=getattr(options, "obstacle_edges", None),
+        ),
+    )
 
 
 def build_default_tracking_camera_specs() -> list[TrackingCameraSpec]:
@@ -333,10 +429,151 @@ def normalize_depth_frame_for_display(
     return np.repeat(normalized[..., None], 3, axis=-1)
 
 
+def normalize_normals_frame_for_display(normals_frame) -> np.ndarray:
+    normals = np.asarray(normals_frame, dtype=np.float32)
+    normals = np.nan_to_num(normals, nan=0.0, posinf=0.0, neginf=0.0)
+    normalized = np.clip(np.round((normals + 1.0) * 127.5), 0.0, 255.0)
+    return normalized.astype(np.uint8)
+
+
+def build_live_preview_panels(
+    *,
+    depth_panel: np.ndarray,
+    normals_panel: np.ndarray | None = None,
+    show_depth_window: bool,
+    show_normals_window: bool,
+    scale: float = 8.0,
+) -> list[tuple[str, np.ndarray]]:
+    panels: list[tuple[str, np.ndarray]] = []
+    if show_depth_window:
+        panels.append((DEPTH_WINDOW_NAME, _resize_live_preview_panel(depth_panel, scale=scale)))
+    if show_normals_window and normals_panel is not None:
+        panels.append((NORMALS_WINDOW_NAME, _resize_live_preview_panel(normals_panel, scale=scale)))
+    return panels
+
+
+def render_route_map_panel(
+    *,
+    terrain_origins,
+    current_position_xy,
+    current_yaw: float,
+    route_waypoints_xy: list[list[float]] | list[tuple[float, float]] | None = None,
+    center_origin=None,
+    tile_wall_edges=None,
+    image_size: tuple[int, int] = (720, 720),
+) -> np.ndarray:
+    origins = np.asarray(terrain_origins, dtype=np.float32)
+    if origins.ndim != 3 or origins.shape[-1] != 3:
+        raise ValueError(f"Expected terrain origins with shape (rows, cols, 3), got {origins.shape}.")
+
+    height = int(image_size[0])
+    width = int(image_size[1])
+    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
+
+    tile_size_x = _estimate_grid_spacing(origins[..., 0], default=8.0)
+    tile_size_y = _estimate_grid_spacing(origins[..., 1], default=8.0)
+    min_x = float(origins[..., 0].min() - tile_size_x * 0.5)
+    max_x = float(origins[..., 0].max() + tile_size_x * 0.5)
+    min_y = float(origins[..., 1].min() - tile_size_y * 0.5)
+    max_y = float(origins[..., 1].max() + tile_size_y * 0.5)
+
+    extra_points: list[np.ndarray] = [np.asarray(current_position_xy, dtype=np.float32).reshape(2)]
+    if center_origin is not None:
+        extra_points.append(np.asarray(center_origin, dtype=np.float32).reshape(-1)[:2])
+    if route_waypoints_xy:
+        extra_points.append(np.asarray(route_waypoints_xy, dtype=np.float32).reshape(-1, 2))
+    if extra_points:
+        stacked_points = np.concatenate([points.reshape(-1, 2) for points in extra_points], axis=0)
+        min_x = min(min_x, float(stacked_points[:, 0].min()))
+        max_x = max(max_x, float(stacked_points[:, 0].max()))
+        min_y = min(min_y, float(stacked_points[:, 1].min()))
+        max_y = max(max_y, float(stacked_points[:, 1].max()))
+
+    bounds = _expand_xy_bounds((min_x, max_x, min_y, max_y), min_padding=0.5)
+    margin = max(8, int(min(width, height) * 0.06))
+    grid_color = (216, 222, 228)
+    wall_color = (15, 23, 42)
+    route_color = (250, 170, 40)
+    center_color = (225, 29, 72)
+    robot_color = (14, 165, 233)
+
+    for origin in origins.reshape(-1, 3):
+        top_left = _world_xy_to_panel_pixel(
+            (origin[0] - tile_size_x * 0.5, origin[1] + tile_size_y * 0.5),
+            bounds=bounds,
+            image_size=(height, width),
+            margin=margin,
+        )
+        bottom_right = _world_xy_to_panel_pixel(
+            (origin[0] + tile_size_x * 0.5, origin[1] - tile_size_y * 0.5),
+            bounds=bounds,
+            image_size=(height, width),
+            margin=margin,
+        )
+        cv2.rectangle(canvas, top_left, bottom_right, color=grid_color, thickness=1, lineType=cv2.LINE_AA)
+
+    if tile_wall_edges is not None:
+        for row in range(origins.shape[0]):
+            for col in range(origins.shape[1]):
+                for wall in _translate_tile_wall_edges(tile_wall_edges[row][col], origins[row, col, :2]):
+                    x0, y0, x1, y1 = _wall_edge_to_segment(wall)
+                    start = _world_xy_to_panel_pixel((x0, y0), bounds=bounds, image_size=(height, width), margin=margin)
+                    end = _world_xy_to_panel_pixel((x1, y1), bounds=bounds, image_size=(height, width), margin=margin)
+                    cv2.line(canvas, start, end, color=wall_color, thickness=2, lineType=cv2.LINE_AA)
+
+    if route_waypoints_xy:
+        route_waypoints = np.asarray(route_waypoints_xy, dtype=np.float32).reshape(-1, 2)
+        route_pixels = np.asarray(
+            [
+                _world_xy_to_panel_pixel(point, bounds=bounds, image_size=(height, width), margin=margin)
+                for point in route_waypoints
+            ],
+            dtype=np.int32,
+        )
+        cv2.polylines(canvas, [route_pixels], False, color=route_color, thickness=2, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, tuple(route_pixels[0]), 4, color=(34, 197, 94), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, tuple(route_pixels[-1]), 4, color=(239, 68, 68), thickness=-1, lineType=cv2.LINE_AA)
+
+    if center_origin is not None:
+        center_xy = np.asarray(center_origin, dtype=np.float32).reshape(-1)[:2]
+        center_px = _world_xy_to_panel_pixel(center_xy, bounds=bounds, image_size=(height, width), margin=margin)
+        cv2.drawMarker(
+            canvas,
+            center_px,
+            color=center_color,
+            markerType=cv2.MARKER_STAR,
+            markerSize=12,
+            thickness=1,
+            line_type=cv2.LINE_AA,
+        )
+
+    robot_xy = np.asarray(current_position_xy, dtype=np.float32).reshape(2)
+    robot_px = _world_xy_to_panel_pixel(robot_xy, bounds=bounds, image_size=(height, width), margin=margin)
+    cv2.circle(canvas, robot_px, 5, color=robot_color, thickness=-1, lineType=cv2.LINE_AA)
+
+    arrow_length_px = max(10, int(min(width, height) * 0.06))
+    heading_end = (
+        int(round(robot_px[0] + math.cos(float(current_yaw)) * arrow_length_px)),
+        int(round(robot_px[1] - math.sin(float(current_yaw)) * arrow_length_px)),
+    )
+    cv2.arrowedLine(
+        canvas,
+        robot_px,
+        heading_end,
+        color=robot_color,
+        thickness=2,
+        tipLength=0.25,
+        line_type=cv2.LINE_AA,
+    )
+
+    return canvas
+
+
 def compose_recording_frame(
     rgb_frames: dict[str, np.ndarray],
     depth_frame: np.ndarray,
-    labels: tuple[str, str, str, str] | None = None,
+    extra_panels: list[np.ndarray] | None = None,
+    labels: Sequence[str] | None = None,
 ) -> np.ndarray:
     ordered_panels = [
         _ensure_rgb_uint8(rgb_frames["hero"]),
@@ -344,6 +581,8 @@ def compose_recording_frame(
         _ensure_rgb_uint8(rgb_frames["overview"]),
         _ensure_rgb_uint8(depth_frame),
     ]
+    if extra_panels:
+        ordered_panels.extend(_ensure_rgb_uint8(panel) for panel in extra_panels)
     base_height, base_width = ordered_panels[0].shape[:2]
     resized_panels = [
         _resize_panel(panel, (base_width, base_height)) if panel.shape[:2] != (base_height, base_width) else panel
@@ -354,9 +593,20 @@ def compose_recording_frame(
             _annotate_panel(panel.copy(), label)
             for panel, label in zip(resized_panels, labels, strict=True)
         ]
-    top_row = np.concatenate(resized_panels[:2], axis=1)
-    bottom_row = np.concatenate(resized_panels[2:], axis=1)
-    return np.concatenate([top_row, bottom_row], axis=0)
+    if len(resized_panels) <= 4:
+        top_row = np.concatenate(resized_panels[:2], axis=1)
+        bottom_row = np.concatenate(resized_panels[2:], axis=1)
+        return np.concatenate([top_row, bottom_row], axis=0)
+
+    num_cols = 3
+    blank_panel = np.zeros_like(resized_panels[0], dtype=np.uint8)
+    while len(resized_panels) % num_cols != 0:
+        resized_panels.append(blank_panel.copy())
+    rows = [
+        np.concatenate(resized_panels[row_start : row_start + num_cols], axis=1)
+        for row_start in range(0, len(resized_panels), num_cols)
+    ]
+    return np.concatenate(rows, axis=0)
 
 
 def resolve_video_capture_settings(
@@ -403,6 +653,180 @@ def build_play_video_output_path(
     resolved_timestamp = datetime.now() if timestamp is None else timestamp
     file_stem += f"-{resolved_timestamp.strftime('%Y%m%d_%H%M%S')}"
     return str(log_dir_path / "videos" / "play" / f"{file_stem}.mp4")
+
+
+def compute_contact_overlay_state(
+    positions_w,
+    net_forces_w,
+    *,
+    force_threshold: float = 1.0,
+    force_scale: float = 0.0025,
+) -> ContactOverlayState:
+    positions = np.asarray(positions_w, dtype=np.float32).reshape(-1, 3)
+    forces = np.asarray(net_forces_w, dtype=np.float32).reshape(-1, 3)
+    magnitudes = np.linalg.norm(forces, axis=1)
+    active_mask = magnitudes > float(force_threshold)
+    directions = np.zeros_like(forces, dtype=np.float32)
+    if np.any(active_mask):
+        directions[active_mask] = forces[active_mask] / magnitudes[active_mask, None]
+    lengths = np.where(active_mask, magnitudes * float(force_scale), 0.0).astype(np.float32)
+    return ContactOverlayState(
+        positions=positions,
+        directions=directions,
+        lengths=lengths,
+        active_mask=active_mask.astype(bool),
+    )
+
+
+def detect_new_contact_events(previous_contact_mask, current_contact_mask) -> np.ndarray:
+    previous_mask = np.asarray(previous_contact_mask, dtype=bool).reshape(-1)
+    current_mask = np.asarray(current_contact_mask, dtype=bool).reshape(-1)
+    if previous_mask.shape != current_mask.shape:
+        raise ValueError(
+            f"Contact masks must share the same shape, got {previous_mask.shape} and {current_mask.shape}."
+        )
+    return np.logical_and(~previous_mask, current_mask)
+
+
+def _configure_ghost_reference_preview(motion_reference) -> None:
+    motion_reference.debug_vis = True
+    if getattr(motion_reference, "visualizing_robot_from", "aiming_frame") == "aiming_frame":
+        motion_reference.visualizing_robot_from = "reference_frame"
+    offset = np.asarray(getattr(motion_reference, "visualizing_robot_offset", (0.0, 0.0, 0.0)), dtype=np.float32)
+    if offset.shape != (3,) or np.allclose(offset, 0.0):
+        motion_reference.visualizing_robot_offset = (0.0, 1.5, 0.0)
+
+
+def _get_play_visualization_config(options) -> PlayVisualizationConfig:
+    visualization = getattr(options, "visualization", None)
+    if visualization is None:
+        return PlayVisualizationConfig(
+            depth_window=bool(getattr(options, "show_depth_window", False)),
+            depth_coverage=bool(getattr(options, "show_depth_coverage", False)),
+            normals_panel=bool(getattr(options, "normals_panel", False)),
+            route_overlay=bool(getattr(options, "route_overlay", False)),
+            foot_contact_overlay=bool(getattr(options, "foot_contact_overlay", False)),
+            ghost_reference=bool(getattr(options, "ghost_reference", False)),
+            obstacle_edges=bool(getattr(options, "obstacle_edges", False)),
+        )
+    if isinstance(visualization, PlayVisualizationConfig):
+        return visualization
+    return PlayVisualizationConfig(
+        depth_window=bool(getattr(visualization, "depth_window", False)),
+        depth_coverage=bool(getattr(visualization, "depth_coverage", False)),
+        normals_panel=bool(getattr(visualization, "normals_panel", False)),
+        route_overlay=bool(getattr(visualization, "route_overlay", False)),
+        foot_contact_overlay=bool(getattr(visualization, "foot_contact_overlay", False)),
+        ghost_reference=bool(getattr(visualization, "ghost_reference", False)),
+        obstacle_edges=bool(getattr(visualization, "obstacle_edges", False)),
+    )
+
+
+def _resolve_visualization_flag(*, default: bool, override: bool | None) -> bool:
+    if override is None:
+        return bool(default)
+    return bool(override)
+
+
+def _apply_visualization_sensor_requirements(env_cfg, options) -> None:
+    visualization = _get_play_visualization_config(options)
+    if visualization.normals_panel:
+        _ensure_camera_data_type(env_cfg, "normals")
+
+
+def _ensure_camera_data_type(env_cfg, data_type: str) -> None:
+    camera = getattr(getattr(env_cfg, "scene", None), "camera", None)
+    if camera is None:
+        return
+    data_types = getattr(camera, "data_types", None)
+    if data_types is None:
+        camera.data_types = [data_type]
+        return
+    if data_type in data_types:
+        return
+    if isinstance(data_types, tuple):
+        camera.data_types = list(data_types) + [data_type]
+        return
+    if isinstance(data_types, list):
+        camera.data_types.append(data_type)
+        return
+    camera.data_types = [*list(data_types), data_type]
+
+
+def _resize_live_preview_panel(panel: np.ndarray, *, scale: float) -> np.ndarray:
+    if scale == 1.0:
+        return panel
+    return cv2.resize(panel, None, fx=float(scale), fy=float(scale), interpolation=cv2.INTER_NEAREST)
+
+
+def _estimate_grid_spacing(values: np.ndarray, *, default: float) -> float:
+    flattened = np.unique(np.asarray(values, dtype=np.float32).reshape(-1))
+    if flattened.size <= 1:
+        return float(default)
+    diffs = np.diff(np.sort(flattened))
+    positive_diffs = diffs[diffs > 1e-5]
+    if positive_diffs.size == 0:
+        return float(default)
+    return float(np.median(positive_diffs))
+
+
+def _expand_xy_bounds(bounds: tuple[float, float, float, float], *, min_padding: float) -> tuple[float, float, float, float]:
+    min_x, max_x, min_y, max_y = bounds
+    span_x = max(max_x - min_x, 1e-6)
+    span_y = max(max_y - min_y, 1e-6)
+    padding = max(min_padding, max(span_x, span_y) * 0.05)
+    return (min_x - padding, max_x + padding, min_y - padding, max_y + padding)
+
+
+def _world_xy_to_panel_pixel(
+    xy,
+    *,
+    bounds: tuple[float, float, float, float],
+    image_size: tuple[int, int],
+    margin: int,
+) -> tuple[int, int]:
+    min_x, max_x, min_y, max_y = bounds
+    height, width = image_size
+    x = float(np.asarray(xy, dtype=np.float32).reshape(2)[0])
+    y = float(np.asarray(xy, dtype=np.float32).reshape(2)[1])
+    usable_width = max(width - 1 - margin * 2, 1)
+    usable_height = max(height - 1 - margin * 2, 1)
+    x_norm = 0.0 if max_x - min_x <= 1e-6 else (x - min_x) / (max_x - min_x)
+    y_norm = 0.0 if max_y - min_y <= 1e-6 else (y - min_y) / (max_y - min_y)
+    px = int(round(margin + x_norm * usable_width))
+    py = int(round(height - 1 - (margin + y_norm * usable_height)))
+    return (int(np.clip(px, 0, width - 1)), int(np.clip(py, 0, height - 1)))
+
+
+def _translate_tile_wall_edges(wall_edges: list[dict] | None, offset_xy) -> list[dict]:
+    if not wall_edges:
+        return []
+    offset = np.asarray(offset_xy, dtype=np.float32).reshape(2)
+    return [
+        {
+            "side": str(wall["side"]),
+            "xy": (
+                float(wall["xy"][0]) + float(offset[0]),
+                float(wall["xy"][1]) + float(offset[1]),
+            ),
+            "width": float(wall["width"]),
+            "height": float(wall["height"]),
+        }
+        for wall in wall_edges
+    ]
+
+
+def _wall_edge_to_segment(wall: dict) -> tuple[float, float, float, float]:
+    x = float(wall["xy"][0])
+    y = float(wall["xy"][1])
+    width = float(wall["width"])
+    height = float(wall["height"])
+    side = str(wall["side"])
+    if side in {"left", "right"}:
+        wall_x = x + width * 0.5
+        return wall_x, y, wall_x, y + height
+    wall_y = y + height * 0.5
+    return x, wall_y, x + width, wall_y
 
 
 def _discover_single_display_active_gpu(*, command_runner) -> int | None:

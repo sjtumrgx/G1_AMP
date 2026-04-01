@@ -266,6 +266,213 @@ What this command does:
 - `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
 - `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
 
+### Parkour Play Visualization Modules
+
+The parkour play path has a centralized visualization-default block at:
+
+- `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py`
+- class: `ParkourPlayVisualizationCfg`
+
+The seven visualization toggles in that config are:
+
+- `depth_window`
+- `depth_coverage`
+- `normals_panel`
+- `route_overlay`
+- `foot_contact_overlay`
+- `ghost_reference`
+- `obstacle_edges`
+
+At runtime, `scripts/instinct_rl/play_depth.py` resolves these defaults through `resolve_play_visualization_config()` in `source/instinctlab/instinctlab/tasks/parkour/scripts/play_runtime.py`.
+
+Precedence rules:
+
+- First set your default behavior in `ParkourPlayVisualizationCfg`.
+- Then override per run from the CLI.
+- These flags use `argparse.BooleanOptionalAction`, so each toggle supports both enable and disable forms.
+
+CLI override forms:
+
+- `--show_depth_window` / `--no-show_depth_window`
+- `--show_depth_coverage` / `--no-show_depth_coverage`
+- `--normals_panel` / `--no-normals_panel`
+- `--route_overlay` / `--no-route_overlay`
+- `--foot_contact_overlay` / `--no-foot_contact_overlay`
+- `--ghost_reference` / `--no-ghost_reference`
+- `--obstacle_edges` / `--no-obstacle_edges`
+
+Examples:
+
+```bash
+# Enable all seven visualizations for one run
+OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
+    --task=Instinct-Parkour-Target-Amp-G1-v0 \
+    --load_run=20260327_163647 \
+    --replay_route=outputs/parkour/routes/Instinct-Parkour-Target-Amp-G1-v0-seed123.json \
+    --video \
+    --show_depth_window \
+    --show_depth_coverage \
+    --normals_panel \
+    --route_overlay \
+    --foot_contact_overlay \
+    --ghost_reference \
+    --obstacle_edges
+
+# Start from config defaults, but disable just the ghost
+OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
+    --task=Instinct-Parkour-Target-Amp-G1-v0 \
+    --load_run=20260327_163647 \
+    --no-ghost_reference
+```
+
+#### 1. `depth_window`
+
+- Purpose: opens a live OpenCV depth preview window named `parkour_depth`.
+- Enable:
+  - config: `depth_window = True`
+  - CLI: `--show_depth_window`
+- Disable:
+  - config: `depth_window = False`
+  - CLI: `--no-show_depth_window`
+- Where it appears:
+  - live interactive preview window only
+  - the recorded video always includes the processed depth panel regardless of the separate live window
+- Main tunables:
+  - preview scale is currently code-level in `build_live_preview_panels(scale=8.0)` in `play_runtime.py`
+  - displayed depth range comes from the camera noise pipeline normalization config:
+    - `env_cfg.scene.camera.noise_pipeline.depth_normalization.depth_range`
+    - if normalization is missing, play falls back to `0.0` to `2.5` meters
+
+#### 2. `depth_coverage`
+
+- Purpose: draws the raw grouped ray-caster field-of-view coverage into the 3D scene.
+- Enable:
+  - config: `depth_coverage = True`
+  - CLI: `--show_depth_coverage`
+- Disable:
+  - config: `depth_coverage = False`
+  - CLI: `--no-show_depth_coverage`
+- What it shows:
+  - the raw camera coverage footprint, not the final cropped policy depth tensor
+- Main tunables:
+  - camera ray pattern size from `scene.camera.pattern_cfg.height` and `scene.camera.pattern_cfg.width`
+  - policy crop from `scene.camera.noise_pipeline.crop_and_resize.crop_region`
+  - camera extrinsics / placement from the parkour scene camera config in `parkour_env_cfg.py`
+
+#### 3. `normals_panel`
+
+- Purpose: shows a false-color surface-normal visualization from the same ray-caster camera.
+- Enable:
+  - config: `normals_panel = True`
+  - CLI: `--normals_panel`
+- Disable:
+  - config: `normals_panel = False`
+  - CLI: `--no-normals_panel`
+- Where it appears:
+  - live OpenCV window named `parkour_normals`
+  - recorded composite video as the fifth panel
+- Main tunables:
+  - the camera must emit the `normals` data type; play auto-adds it when this toggle is enabled
+  - preview scale is shared with the depth window via `build_live_preview_panels(scale=8.0)`
+  - false-color conversion is handled by `normalize_normals_frame_for_display()` in `play_runtime.py`
+
+#### 4. `route_overlay`
+
+- Purpose: draws route-following diagnostics in the 3D scene.
+- Enable:
+  - config: `route_overlay = True`
+  - CLI: `--route_overlay`
+- Disable:
+  - config: `route_overlay = False`
+  - CLI: `--no-route_overlay`
+- What it shows:
+  - the exact saved route polyline in amber
+  - a short predicted future trajectory in cyan
+- Important behavior:
+  - the overlay now draws the original route polyline directly; it does not spline-smooth the saved waypoints
+- Main tunables:
+  - route geometry itself comes from `--replay_route=...` or from the JSON route artifact you edit/save
+  - replay follower behavior is controlled by:
+    - `--route_lookahead_m`
+    - `--route_goal_tolerance_m`
+    - `--route_cruise_speed`
+  - predicted overlay horizon is currently code-level in `RouteOverlayDebugDraw`:
+    - `prediction_horizon_s=1.0`
+    - `prediction_samples=20`
+
+#### 5. `foot_contact_overlay`
+
+- Purpose: visualizes foot contact forces and touchdown events.
+- Enable:
+  - config: `foot_contact_overlay = True`
+  - CLI: `--foot_contact_overlay`
+- Disable:
+  - config: `foot_contact_overlay = False`
+  - CLI: `--no-foot_contact_overlay`
+- What it shows:
+  - red arrows for active foot contact forces
+  - yellow markers for recent touchdown points
+- Main tunables:
+  - currently code-level in `FootContactOverlayRig` inside `scripts/instinct_rl/play_depth.py`
+  - key values are:
+    - `touchdown_ttl_steps=300`
+    - `force_threshold=1.0`
+    - `force_scale=0.0025`
+
+#### 6. `ghost_reference`
+
+- Purpose: shows the motion-reference robot as a side-by-side visual ghost for qualitative comparison.
+- Enable:
+  - config: `ghost_reference = True`
+  - CLI: `--ghost_reference`
+- Disable:
+  - config: `ghost_reference = False`
+  - CLI: `--no-ghost_reference`
+- What play mode does when enabled:
+  - turns on `motion_reference.debug_vis`
+  - switches the preview ghost to `visualizing_robot_from="reference_frame"` when it was still using `aiming_frame`
+  - applies a default lateral offset of `(0.0, 1.5, 0.0)` if no offset was configured, so the ghost is readable instead of overlapping the live robot
+- Main tunables:
+  - `motion_reference.visualizing_robot_from`
+  - `motion_reference.visualizing_robot_offset`
+  - `motion_reference.reference_prim_path`
+  - `motion_reference.visualizing_marker_types`
+  - these live in the motion-reference config used by the parkour task
+
+#### 7. `obstacle_edges`
+
+- Purpose: highlights obstacle boundaries and terrain-generated wall edges in the scene.
+- Enable:
+  - config: `obstacle_edges = True`
+  - CLI: `--obstacle_edges`
+- Disable:
+  - config: `obstacle_edges = False`
+  - CLI: `--no-obstacle_edges`
+- What it shows:
+  - the terrain / obstacle edge debug representation registered from the terrain metadata
+- Main tunables:
+  - wall generation parameters in the terrain generator config, especially:
+    - `wall_prob`
+    - `wall_height`
+    - `wall_thickness`
+  - for replay, the exact wall layout can also come from `tile_wall_edges` embedded inside the saved route artifact
+
+### Recorded Video Layout
+
+When `--video_layout quad` is active, the composite recorder uses a 3x2 grid once extra panels are present.
+
+- Base 4 panels:
+  - `Hero`
+  - `Side`
+  - `Overview`
+  - `Depth`
+- Fifth panel:
+  - `Normals` when `normals_panel` is enabled
+- Sixth panel:
+  - `Route Map` during replay video capture when a route artifact is loaded
+
+The `Route Map` panel is an automatically generated debug view of the replay route, terrain tile layout, wall edges, map center, and current robot pose. It is not one of the seven top-level play-visualization toggles, but it fills the sixth composite slot during replay recording so the grid is no longer padded with an empty panel.
+
 Notes:
 
 - The red coverage visualization shows the raw grouped ray-caster field of view. The policy depth observation is still a cropped lower-center patch after preprocessing.

@@ -12,19 +12,25 @@ sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab"
 
 from isaaclab.app import AppLauncher
 from play_runtime import (
+    DEPTH_WINDOW_NAME,
+    NORMALS_WINDOW_NAME,
     add_play_runtime_args,
     build_play_video_output_path,
     build_default_tracking_camera_specs,
+    build_live_preview_panels,
     compose_recording_frame,
     compute_tracking_camera_views,
     create_keyboard_event_subscription,
     ensure_sensor_initialized,
     normalize_depth_frame_for_display,
+    normalize_normals_frame_for_display,
     prepare_play_env_cfg,
+    resolve_play_visualization_config,
     resolve_recording_camera_resolution,
     resolve_interactive_rendering_gpu_override,
     resolve_play_seed,
     resolve_video_capture_settings,
+    render_route_map_panel,
     select_center_terrain_origin,
     validate_isaacsim_python_environment,
 )
@@ -114,12 +120,15 @@ import torch
 
 import carb.input
 import cv2
+import isaaclab.utils.math as math_utils
 from carb.input import KeyboardEventType
 from instinct_rl.runners import OnPolicyRunner
 from instinct_rl.utils.utils import get_obs_slice, get_subobs_by_components, get_subobs_size
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs import DirectMARLEnv, multi_agent_to_single_agent
+from isaaclab.markers import VisualizationMarkers
+from isaaclab.markers.config import RED_ARROW_X_MARKER_CFG, SPHERE_MARKER_CFG
 from isaaclab.sensors.camera import Camera, CameraCfg
 from isaaclab_tasks.utils import get_checkpoint_path, parse_env_cfg
 
@@ -132,8 +141,13 @@ from instinctlab.tasks.parkour.scripts.config_loading import load_logged_config
 from instinctlab.tasks.parkour.scripts.play_route import (
     RouteWaypointFollower,
     RouteWaypointRecorder,
+    build_line_strip_segments,
     build_tile_wall_edges_grid,
+    build_route_overlay_points,
+    detect_new_contact_events,
     load_route_artifact,
+    compute_contact_overlay_state,
+    predict_future_trajectory_points,
     save_route_artifact,
 )
 from instinctlab.utils.wrappers import InstinctRlVecEnvWrapper
@@ -200,6 +214,15 @@ def _read_depth_panel(env, env_cfg) -> np.ndarray:
     return normalize_depth_frame_for_display(depth_frame, depth_range)
 
 
+def _read_normals_panel(env) -> np.ndarray | None:
+    camera_sensor = env.unwrapped.scene.sensors["camera"]
+    outputs = camera_sensor.data.output
+    if "normals" not in outputs:
+        return None
+    normals_frame = outputs["normals"][0].detach().cpu().numpy()
+    return normalize_normals_frame_for_display(normals_frame)
+
+
 def _log_depth_input_design(env_cfg) -> None:
     camera_cfg = env_cfg.scene.camera
     crop_cfg = None
@@ -216,6 +239,181 @@ def _log_depth_input_design(env_cfg) -> None:
     )
 
 
+class RouteOverlayDebugDraw:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        route_points: list[tuple[float, float, float]] | None = None,
+        prediction_horizon_s: float = 1.0,
+        prediction_samples: int = 20,
+    ):
+        self.enabled = enabled
+        self.route_points = route_points or []
+        self.prediction_horizon_s = float(prediction_horizon_s)
+        self.prediction_samples = int(prediction_samples)
+        self._draw = None
+        if not self.enabled:
+            return
+        try:
+            from isaacsim.util.debug_draw import _debug_draw
+
+            self._draw = _debug_draw.acquire_debug_draw_interface()
+        except Exception as exc:  # pragma: no cover - runtime-only dependency
+            print(f"[WARN] Route overlay disabled because debug_draw is unavailable: {exc}")
+            self.enabled = False
+
+    def update(self, *, position_xy, yaw: float, command) -> None:
+        if not self.enabled or self._draw is None:
+            return
+
+        self._draw.clear_lines()
+        route_starts, route_ends = build_line_strip_segments(self.route_points)
+        if route_starts:
+            self._draw.draw_lines(
+                route_starts,
+                route_ends,
+                [(1.0, 0.85, 0.2, 1.0)] * len(route_starts),
+                [3.0] * len(route_starts),
+            )
+
+        prediction_points = predict_future_trajectory_points(
+            position_xy=position_xy,
+            yaw=yaw,
+            command=command,
+            horizon_s=self.prediction_horizon_s,
+            num_samples=self.prediction_samples,
+            z_height=0.08,
+        )
+        if len(prediction_points) < 2:
+            return
+        self._draw.draw_lines(
+            prediction_points[:-1],
+            prediction_points[1:],
+            [(0.15, 0.85, 1.0, 1.0)] * (len(prediction_points) - 1),
+            [2.0] * (len(prediction_points) - 1),
+        )
+
+    def close(self) -> None:
+        if self._draw is not None:
+            self._draw.clear_lines()
+
+
+class FootContactOverlayRig:
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        env,
+        touchdown_ttl_steps: int = 300,
+        force_threshold: float = 1.0,
+        force_scale: float = 0.0025,
+    ):
+        self.enabled = enabled
+        self.touchdown_ttl_steps = int(touchdown_ttl_steps)
+        self.force_threshold = float(force_threshold)
+        self.force_scale = float(force_scale)
+        self._footfall_records: list[tuple[int, np.ndarray]] = []
+        self._previous_contact_mask = np.zeros(0, dtype=bool)
+        if not self.enabled:
+            return
+
+        self._robot = env.unwrapped.scene["robot"]
+        self._contact_sensor = env.unwrapped.scene.sensors["contact_forces"]
+        self._robot_foot_ids, _ = self._robot.find_bodies(".*_ankle_roll_link", preserve_order=True)
+        self._sensor_foot_ids, _ = self._contact_sensor.find_bodies(".*_ankle_roll_link", preserve_order=True)
+        self._previous_contact_mask = np.zeros(len(self._robot_foot_ids), dtype=bool)
+
+        arrow_cfg = RED_ARROW_X_MARKER_CFG.replace(prim_path="/Visuals/Play/foot_contact_forces")
+        arrow_cfg.markers["arrow"].scale = (1.0, 0.05, 0.05)
+        marker_cfg = SPHERE_MARKER_CFG.replace(prim_path="/Visuals/Play/footfall_markers")
+        marker_cfg.markers["sphere"].radius = 0.05
+        marker_cfg.markers["sphere"].visual_material = sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.8, 0.1))
+        self._force_visualizer = VisualizationMarkers(arrow_cfg)
+        self._footfall_visualizer = VisualizationMarkers(marker_cfg)
+        self._force_visualizer.set_visibility(False)
+        self._footfall_visualizer.set_visibility(False)
+
+    def update(self, *, timestep: int) -> None:
+        if not self.enabled:
+            return
+
+        foot_positions = self._robot.data.body_pos_w[0, self._robot_foot_ids, :].detach().cpu().numpy()
+        contact_forces = self._contact_sensor.data.net_forces_w[0, self._sensor_foot_ids, :].detach().cpu().numpy()
+        state = compute_contact_overlay_state(
+            foot_positions,
+            contact_forces,
+            force_threshold=self.force_threshold,
+            force_scale=self.force_scale,
+        )
+
+        new_contact_events = detect_new_contact_events(self._previous_contact_mask, state.active_mask)
+        for point in state.positions[new_contact_events]:
+            self._footfall_records.append((int(timestep) + self.touchdown_ttl_steps, point.copy()))
+        self._previous_contact_mask = state.active_mask.copy()
+
+        self._update_force_markers(state)
+        self._update_footfall_markers(timestep=int(timestep))
+
+    def close(self) -> None:
+        if not self.enabled:
+            return
+        self._force_visualizer.set_visibility(False)
+        self._footfall_visualizer.set_visibility(False)
+
+    def _update_force_markers(self, state) -> None:
+        if not np.any(state.active_mask):
+            self._force_visualizer.set_visibility(False)
+            return
+
+        active_positions = torch.as_tensor(state.positions[state.active_mask], device=self._robot.device, dtype=torch.float32)
+        active_directions = torch.as_tensor(
+            state.directions[state.active_mask],
+            device=self._robot.device,
+            dtype=torch.float32,
+        )
+        active_lengths = torch.as_tensor(state.lengths[state.active_mask], device=self._robot.device, dtype=torch.float32)
+
+        quaternions = _vectors_to_world_quaternions(active_directions)
+        scales = torch.ones((active_positions.shape[0], 3), device=self._robot.device, dtype=torch.float32)
+        scales[:, 0] = active_lengths
+        scales[:, 1] = 0.05
+        scales[:, 2] = 0.05
+        self._force_visualizer.set_visibility(True)
+        self._force_visualizer.visualize(
+            translations=active_positions,
+            orientations=quaternions,
+            scales=scales,
+        )
+
+    def _update_footfall_markers(self, *, timestep: int) -> None:
+        self._footfall_records = [
+            (expiry_step, point)
+            for expiry_step, point in self._footfall_records
+            if expiry_step >= timestep
+        ]
+        if not self._footfall_records:
+            self._footfall_visualizer.set_visibility(False)
+            return
+        points = torch.as_tensor(
+            np.stack([point for _, point in self._footfall_records], axis=0),
+            device=self._robot.device,
+            dtype=torch.float32,
+        )
+        self._footfall_visualizer.set_visibility(True)
+        self._footfall_visualizer.visualize(translations=points)
+
+
+def _vectors_to_world_quaternions(vectors: torch.Tensor) -> torch.Tensor:
+    default_direction = torch.zeros_like(vectors)
+    default_direction[:, 0] = 1.0
+    normalized_direction = vectors / torch.norm(vectors, dim=-1, keepdim=True).clamp_min(1e-6)
+    axis = torch.cross(default_direction, normalized_direction, dim=-1)
+    axis = axis / torch.norm(axis, dim=-1, keepdim=True).clamp_min(1e-6)
+    angle = torch.acos(torch.clamp(torch.sum(default_direction * normalized_direction, dim=-1), -1.0, 1.0))
+    return math_utils.quat_from_angle_axis(angle, axis)
+
+
 class PlayCaptureRig:
     def __init__(
         self,
@@ -227,7 +425,10 @@ class PlayCaptureRig:
         video_fps: float,
         video_frame_stride: int,
         show_depth_window: bool,
+        show_normals_panel: bool,
         video_layout: str,
+        route_map_waypoints_xy: list[list[float]] | list[tuple[float, float]] | None = None,
+        route_map_tile_wall_edges=None,
     ):
         self.env = env
         self.env_cfg = env_cfg
@@ -237,15 +438,32 @@ class PlayCaptureRig:
         self.video_fps = video_fps
         self.video_frame_stride = video_frame_stride
         self.show_depth_window = show_depth_window
+        self.show_normals_panel = show_normals_panel
         self.video_layout = video_layout
         self.frames_written = 0
         self.writer = None
-        self.depth_window_name = "parkour_depth"
-        self._depth_window_disabled = False
+        self._preview_window_names = []
+        if self.show_depth_window:
+            self._preview_window_names.append(DEPTH_WINDOW_NAME)
+        if self.show_normals_panel:
+            self._preview_window_names.append(NORMALS_WINDOW_NAME)
+        self._disabled_preview_windows: set[str] = set()
+        self.route_map_waypoints_xy = [list(point) for point in route_map_waypoints_xy] if route_map_waypoints_xy else None
+        self.route_map_tile_wall_edges = route_map_tile_wall_edges
         self._camera_specs = build_default_tracking_camera_specs() if output_path is not None else []
         self._cameras: dict[str, Camera] = {}
         self._camera_resolution = resolve_recording_camera_resolution(video_layout)
         self._camera_warmup_frames = 5
+        terrain = getattr(self.env.unwrapped.scene, "terrain", None)
+        terrain_origins = getattr(terrain, "terrain_origins", None)
+        self._route_map_terrain_origins = (
+            terrain_origins.detach().cpu().numpy() if terrain_origins is not None and self.route_map_waypoints_xy is not None else None
+        )
+        self._route_map_center_origin = (
+            select_center_terrain_origin(self._route_map_terrain_origins)
+            if self._route_map_terrain_origins is not None
+            else None
+        )
         if output_path is not None:
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
             self._cameras = self._create_tracking_cameras()
@@ -261,7 +479,8 @@ class PlayCaptureRig:
 
     def capture(self, timestep: int) -> None:
         depth_panel = _read_depth_panel(self.env, self.env_cfg)
-        self._show_depth_window(depth_panel)
+        normals_panel = _read_normals_panel(self.env) if self.show_normals_panel else None
+        self._show_preview_windows(depth_panel, normals_panel)
 
         if self.output_path is None or timestep < self.video_start_step or self.is_complete:
             return
@@ -271,7 +490,7 @@ class PlayCaptureRig:
         if self.writer is None:
             self.writer = imageio.get_writer(self.output_path, fps=self.video_fps)
 
-        frame = self._build_video_frame(depth_panel)
+        frame = self._build_video_frame(depth_panel, normals_panel)
         self.writer.append_data(frame)
         self.frames_written += 1
 
@@ -279,20 +498,32 @@ class PlayCaptureRig:
         if self.writer is not None:
             self.writer.close()
             self.writer = None
-        if self.show_depth_window and not self._depth_window_disabled:
+        for window_name in self._preview_window_names:
+            if window_name in self._disabled_preview_windows:
+                continue
             try:
-                cv2.destroyWindow(self.depth_window_name)
+                cv2.destroyWindow(window_name)
             except cv2.error:
                 pass
 
-    def _build_video_frame(self, depth_panel: np.ndarray) -> np.ndarray:
+    def _build_video_frame(self, depth_panel: np.ndarray, normals_panel: np.ndarray | None) -> np.ndarray:
         rgb_frames = self._capture_tracking_frames()
         if self.video_layout == "single":
             return rgb_frames["hero"]
+        extra_panels: list[np.ndarray] = []
+        labels = ["Hero", "Side", "Overview", "Depth"]
+        if normals_panel is not None:
+            extra_panels.append(normals_panel)
+            labels.append("Normals")
+        route_map_panel = self._build_route_map_panel()
+        if route_map_panel is not None:
+            extra_panels.append(route_map_panel)
+            labels.append("Route Map")
         return compose_recording_frame(
             rgb_frames,
             depth_panel,
-            labels=("Hero", "Side", "Overview", "Depth"),
+            extra_panels=extra_panels or None,
+            labels=tuple(labels),
         )
 
     def _capture_tracking_frames(self) -> dict[str, np.ndarray]:
@@ -350,19 +581,42 @@ class PlayCaptureRig:
         self.env.unwrapped.sim.render()
         ensure_sensor_initialized(camera, sensor_name=camera.cfg.prim_path)
 
-    def _show_depth_window(self, depth_panel: np.ndarray) -> None:
-        if not self.show_depth_window or self._depth_window_disabled:
+    def _show_preview_windows(self, depth_panel: np.ndarray, normals_panel: np.ndarray | None) -> None:
+        preview_panels = build_live_preview_panels(
+            depth_panel=depth_panel,
+            normals_panel=normals_panel,
+            show_depth_window=self.show_depth_window,
+            show_normals_window=self.show_normals_panel,
+        )
+        if not preview_panels:
             return
-        try:
-            cv2.namedWindow(self.depth_window_name, cv2.WINDOW_NORMAL)
-            cv2.imshow(
-                self.depth_window_name,
-                cv2.resize(depth_panel, None, fx=8.0, fy=8.0, interpolation=cv2.INTER_NEAREST),
-            )
+        displayed_any_panel = False
+        for window_name, panel in preview_panels:
+            if window_name in self._disabled_preview_windows:
+                continue
+            try:
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.imshow(window_name, panel)
+                displayed_any_panel = True
+            except cv2.error as exc:
+                print(f"[WARN] Disabling preview window '{window_name}' after OpenCV error: {exc}")
+                self._disabled_preview_windows.add(window_name)
+        if displayed_any_panel:
             cv2.waitKey(1)
-        except cv2.error as exc:
-            print(f"[WARN] Disabling depth window after OpenCV error: {exc}")
-            self._depth_window_disabled = True
+
+    def _build_route_map_panel(self) -> np.ndarray | None:
+        if self.route_map_waypoints_xy is None or self._route_map_terrain_origins is None:
+            return None
+        root_position, root_yaw = _read_root_state(self.env)
+        return render_route_map_panel(
+            terrain_origins=self._route_map_terrain_origins,
+            center_origin=self._route_map_center_origin,
+            current_position_xy=root_position[:2],
+            current_yaw=root_yaw,
+            route_waypoints_xy=self.route_map_waypoints_xy,
+            tile_wall_edges=self.route_map_tile_wall_edges,
+            image_size=(720, 720),
+        )
 
 
 def main():
@@ -374,6 +628,8 @@ def main():
     interrupted = False
     route_artifact = None
     route_recorder = None
+    route_overlay = None
+    foot_contact_overlay = None
     # parse configuration
     env_cfg = parse_env_cfg(
         args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
@@ -415,6 +671,14 @@ def main():
 
     if args_cli.env_cfg:
         env_cfg = load_logged_config(log_dir, "env")
+    args_cli.visualization = resolve_play_visualization_config(env_cfg, args_cli)
+    args_cli.show_depth_window = args_cli.visualization.depth_window
+    args_cli.show_depth_coverage = args_cli.visualization.depth_coverage
+    args_cli.normals_panel = args_cli.visualization.normals_panel
+    args_cli.route_overlay = args_cli.visualization.route_overlay
+    args_cli.foot_contact_overlay = args_cli.visualization.foot_contact_overlay
+    args_cli.ghost_reference = args_cli.visualization.ghost_reference
+    args_cli.obstacle_edges = args_cli.visualization.obstacle_edges
     play_seed = resolve_play_seed(
         cli_seed=args_cli.seed,
         route_seed=route_artifact.seed if route_artifact is not None else None,
@@ -524,6 +788,17 @@ def main():
                 f"[INFO] Loaded route replay from {args_cli.replay_route}"
                 f" with {len(route_artifact.waypoints_xy)} waypoints."
             )
+        route_overlay_points = None
+        if route_artifact is not None:
+            route_overlay_points = build_route_overlay_points(waypoints_xy=route_artifact.waypoints_xy, z_height=0.08)
+        route_overlay = RouteOverlayDebugDraw(
+            enabled=args_cli.route_overlay,
+            route_points=route_overlay_points,
+        )
+        foot_contact_overlay = FootContactOverlayRig(
+            enabled=args_cli.foot_contact_overlay,
+            env=env,
+        )
 
         def on_keyboard_input(e):
             if keyboard_controller is None:
@@ -601,9 +876,22 @@ def main():
             video_fps=capture_settings.video_fps,
             video_frame_stride=capture_settings.frame_stride,
             show_depth_window=args_cli.show_depth_window,
+            show_normals_panel=args_cli.normals_panel,
             video_layout=args_cli.video_layout,
+            route_map_waypoints_xy=None if route_artifact is None else route_artifact.waypoints_xy,
+            route_map_tile_wall_edges=None if route_artifact is None else route_artifact.tile_wall_edges,
         )
         capture_rig.capture(0)
+        if route_overlay is not None:
+            root_position, root_yaw = _read_root_state(env)
+            current_command = (
+                keyboard_controller.command[0].detach().cpu().numpy()
+                if keyboard_controller is not None
+                else np.zeros(3, dtype=np.float32)
+            )
+            route_overlay.update(position_xy=root_position[:2], yaw=root_yaw, command=current_command)
+        if foot_contact_overlay is not None:
+            foot_contact_overlay.update(timestep=0)
         timestep = 0
         # simulate environment
         while simulation_app.is_running():
@@ -634,6 +922,16 @@ def main():
             if route_recorder is not None:
                 root_position, _ = _read_root_state(env)
                 route_recorder.record_position(root_position)
+            if route_overlay is not None:
+                root_position, root_yaw = _read_root_state(env)
+                current_command = (
+                    keyboard_controller.command[0].detach().cpu().numpy()
+                    if keyboard_controller is not None
+                    else np.zeros(3, dtype=np.float32)
+                )
+                route_overlay.update(position_xy=root_position[:2], yaw=root_yaw, command=current_command)
+            if foot_contact_overlay is not None:
+                foot_contact_overlay.update(timestep=timestep)
             capture_rig.capture(timestep)
 
             if capture_rig.is_complete or (route_follower is not None and route_follower.is_complete):
@@ -650,6 +948,10 @@ def main():
                 route_recorder.record_position(root_position)
             route_path = save_route_artifact(args_cli.save_route, route_recorder.build_artifact())
             print(f"[INFO] Saved route artifact to {route_path}")
+        if route_overlay is not None:
+            route_overlay.close()
+        if foot_contact_overlay is not None:
+            foot_contact_overlay.close()
         if capture_rig is not None:
             capture_rig.close()
         if env is not None:
