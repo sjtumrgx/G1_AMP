@@ -17,6 +17,7 @@ from play_runtime import (
     build_play_video_output_path,
     build_default_tracking_camera_specs,
     build_live_preview_panels,
+    build_route_map_recording_panel,
     compose_recording_frame,
     compute_tracking_camera_views,
     create_keyboard_event_subscription,
@@ -24,6 +25,7 @@ from play_runtime import (
     normalize_depth_frame_for_display,
     normalize_normals_frame_for_display,
     prepare_play_env_cfg,
+    resolve_inference_checkpoint_model_state,
     resolve_play_visualization_config,
     resolve_recording_camera_resolution,
     resolve_interactive_rendering_gpu_override,
@@ -235,6 +237,37 @@ def _log_depth_input_design(env_cfg) -> None:
         f" ({raw_height}x{raw_width}), while the policy depth uses crop region"
         f" {tuple(crop_cfg.crop_region)}. The effective depth image is intentionally the lower-center cropped patch."
     )
+
+
+def _load_play_checkpoint_for_inference(ppo_runner: OnPolicyRunner, checkpoint_path: str):
+    try:
+        return ppo_runner.load(checkpoint_path)
+    except RuntimeError as exc:
+        loaded_dict = torch.load(checkpoint_path, weights_only=True)
+        checkpoint_model_state = loaded_dict.get("model_state_dict")
+        if checkpoint_model_state is None:
+            raise
+
+        compatible_state, skipped_keys, critical_keys = resolve_inference_checkpoint_model_state(
+            checkpoint_state_dict=checkpoint_model_state,
+            expected_state_dict=ppo_runner.alg.actor_critic.state_dict(),
+        )
+        if critical_keys:
+            raise exc
+
+        ppo_runner.alg.actor_critic.load_state_dict(compatible_state, strict=False)
+        policy_normalizer = ppo_runner.normalizers.get("policy")
+        if policy_normalizer is not None and "policy_normalizer_state_dict" in loaded_dict:
+            policy_normalizer.load_state_dict(loaded_dict["policy_normalizer_state_dict"])
+        ppo_runner.current_learning_iteration = int(loaded_dict.get("iter", 0))
+        if skipped_keys:
+            skipped_preview = ", ".join(skipped_keys[:5])
+            suffix = "" if len(skipped_keys) <= 5 else f", ... (+{len(skipped_keys) - 5} more)"
+            print(
+                "[WARN] Loaded checkpoint with inference-only compatibility fallback; "
+                f"skipped non-policy parameters with shape drift: {skipped_preview}{suffix}"
+            )
+        return loaded_dict.get("infos")
 
 
 class RouteOverlayDebugDraw:
@@ -515,6 +548,11 @@ class PlayCaptureRig:
             labels.append("Normals")
         route_map_panel = self._build_route_map_panel()
         if route_map_panel is not None:
+            base_height, base_width = next(iter(rgb_frames.values())).shape[:2]
+            route_map_panel = build_route_map_recording_panel(
+                route_map_panel,
+                output_size=(base_height, base_width),
+            )
             extra_panels.append(route_map_panel)
             labels.append("Route Map")
         return compose_recording_frame(
@@ -712,7 +750,7 @@ def main():
         ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
         if agent_cfg.load_run is not None:
             print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-            ppo_runner.load(resume_path)
+            _load_play_checkpoint_for_inference(ppo_runner, resume_path)
 
         # obtain the trained policy for inference
         if args_cli.sample:

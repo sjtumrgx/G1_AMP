@@ -377,8 +377,8 @@ def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConf
 
 def build_default_tracking_camera_specs() -> list[TrackingCameraSpec]:
     return [
-        TrackingCameraSpec("hero", eye_offset=(-4.0, -1.5, 1.8), target_offset=(1.0, 0.0, 0.9)),
-        TrackingCameraSpec("side", eye_offset=(0.0, -4.5, 1.6), target_offset=(0.7, 0.0, 0.9)),
+        TrackingCameraSpec("hero", eye_offset=(-3.4, -1.1, 1.45), target_offset=(0.9, 0.0, 0.42)),
+        TrackingCameraSpec("side", eye_offset=(0.15, -3.3, 1.35), target_offset=(0.8, 0.0, 0.48)),
         TrackingCameraSpec("overview", eye_offset=(-1.0, 0.0, 5.5), target_offset=(1.0, 0.0, 0.7)),
     ]
 
@@ -468,32 +468,40 @@ def render_route_map_panel(
 
     height = int(image_size[0])
     width = int(image_size[1])
-    canvas = np.full((height, width, 3), 245, dtype=np.uint8)
 
     tile_size_x = _estimate_grid_spacing(origins[..., 0], default=8.0)
     tile_size_y = _estimate_grid_spacing(origins[..., 1], default=8.0)
+    origins, tile_wall_edges = _focus_route_map_tiles(
+        origins,
+        tile_wall_edges=tile_wall_edges,
+        current_position_xy=current_position_xy,
+        route_waypoints_xy=route_waypoints_xy,
+        tile_size_x=tile_size_x,
+        tile_size_y=tile_size_y,
+    )
+    canvas = _build_route_map_canvas(image_size=(height, width))
+
     min_x = float(origins[..., 0].min() - tile_size_x * 0.5)
     max_x = float(origins[..., 0].max() + tile_size_x * 0.5)
     min_y = float(origins[..., 1].min() - tile_size_y * 0.5)
     max_y = float(origins[..., 1].max() + tile_size_y * 0.5)
 
-    extra_points: list[np.ndarray] = [np.asarray(current_position_xy, dtype=np.float32).reshape(2)]
-    if center_origin is not None:
-        extra_points.append(np.asarray(center_origin, dtype=np.float32).reshape(-1)[:2])
+    focus_points: list[np.ndarray] = [np.asarray(current_position_xy, dtype=np.float32).reshape(2)]
     if route_waypoints_xy:
-        extra_points.append(np.asarray(route_waypoints_xy, dtype=np.float32).reshape(-1, 2))
-    if extra_points:
-        stacked_points = np.concatenate([points.reshape(-1, 2) for points in extra_points], axis=0)
-        min_x = min(min_x, float(stacked_points[:, 0].min()))
-        max_x = max(max_x, float(stacked_points[:, 0].max()))
-        min_y = min(min_y, float(stacked_points[:, 1].min()))
-        max_y = max(max_y, float(stacked_points[:, 1].max()))
+        focus_points.append(np.asarray(route_waypoints_xy, dtype=np.float32).reshape(-1, 2))
+    stacked_points = np.concatenate([points.reshape(-1, 2) for points in focus_points], axis=0)
+    min_x = min(min_x, float(stacked_points[:, 0].min()))
+    max_x = max(max_x, float(stacked_points[:, 0].max()))
+    min_y = min(min_y, float(stacked_points[:, 1].min()))
+    max_y = max(max_y, float(stacked_points[:, 1].max()))
 
-    bounds = _expand_xy_bounds((min_x, max_x, min_y, max_y), min_padding=0.5)
+    bounds = _expand_xy_bounds((min_x, max_x, min_y, max_y), min_padding=min(tile_size_x, tile_size_y) * 0.35)
     margin = max(8, int(min(width, height) * 0.06))
-    grid_color = (216, 222, 228)
+    tile_fill_color = (236, 240, 244)
+    grid_color = (205, 213, 223)
     wall_color = (15, 23, 42)
-    route_color = (250, 170, 40)
+    route_color = (245, 158, 11)
+    route_glow_color = (255, 225, 168)
     center_color = (225, 29, 72)
     robot_color = (14, 165, 233)
 
@@ -510,6 +518,7 @@ def render_route_map_panel(
             image_size=(height, width),
             margin=margin,
         )
+        cv2.rectangle(canvas, top_left, bottom_right, color=tile_fill_color, thickness=-1, lineType=cv2.LINE_AA)
         cv2.rectangle(canvas, top_left, bottom_right, color=grid_color, thickness=1, lineType=cv2.LINE_AA)
 
     if tile_wall_edges is not None:
@@ -530,11 +539,14 @@ def render_route_map_panel(
             ],
             dtype=np.int32,
         )
+        cv2.polylines(canvas, [route_pixels], False, color=route_glow_color, thickness=6, lineType=cv2.LINE_AA)
         cv2.polylines(canvas, [route_pixels], False, color=route_color, thickness=2, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, tuple(route_pixels[0]), 6, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, tuple(route_pixels[-1]), 6, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(canvas, tuple(route_pixels[0]), 4, color=(34, 197, 94), thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(canvas, tuple(route_pixels[-1]), 4, color=(239, 68, 68), thickness=-1, lineType=cv2.LINE_AA)
 
-    if center_origin is not None:
+    if center_origin is not None and route_waypoints_xy is None:
         center_xy = np.asarray(center_origin, dtype=np.float32).reshape(-1)[:2]
         center_px = _world_xy_to_panel_pixel(center_xy, bounds=bounds, image_size=(height, width), margin=margin)
         cv2.drawMarker(
@@ -549,6 +561,7 @@ def render_route_map_panel(
 
     robot_xy = np.asarray(current_position_xy, dtype=np.float32).reshape(2)
     robot_px = _world_xy_to_panel_pixel(robot_xy, bounds=bounds, image_size=(height, width), margin=margin)
+    cv2.circle(canvas, robot_px, 8, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
     cv2.circle(canvas, robot_px, 5, color=robot_color, thickness=-1, lineType=cv2.LINE_AA)
 
     arrow_length_px = max(10, int(min(width, height) * 0.06))
@@ -565,8 +578,79 @@ def render_route_map_panel(
         tipLength=0.25,
         line_type=cv2.LINE_AA,
     )
+    cv2.rectangle(canvas, (4, 4), (width - 5, height - 5), color=(214, 223, 233), thickness=1, lineType=cv2.LINE_AA)
 
     return canvas
+
+
+def build_route_map_recording_panel(route_map_panel: np.ndarray, *, output_size: tuple[int, int]) -> np.ndarray:
+    route_map = _ensure_rgb_uint8(route_map_panel)
+    output_height = int(output_size[0])
+    output_width = int(output_size[1])
+    map_height, map_width = route_map.shape[:2]
+    if map_height > output_height or map_width > output_width:
+        raise ValueError(
+            f"Route map panel with shape {route_map.shape[:2]} does not fit within output size {output_size}."
+        )
+
+    canvas = np.zeros((output_height, output_width, 3), dtype=np.uint8)
+    left_color = np.array([20, 28, 43], dtype=np.float32)
+    right_color = np.array([33, 47, 72], dtype=np.float32)
+    for column in range(output_width):
+        alpha = 0.0 if output_width <= 1 else float(column) / float(output_width - 1)
+        canvas[:, column] = np.round((1.0 - alpha) * left_color + alpha * right_color).astype(np.uint8)
+
+    inset_x = (output_width - map_width) // 2
+    inset_y = (output_height - map_height) // 2
+    canvas[inset_y : inset_y + map_height, inset_x : inset_x + map_width] = route_map
+
+    if inset_x > 0:
+        cv2.line(
+            canvas,
+            (inset_x - 12, 14),
+            (inset_x - 12, output_height - 15),
+            color=(87, 124, 187),
+            thickness=2,
+            lineType=cv2.LINE_AA,
+        )
+        cv2.line(
+            canvas,
+            (inset_x + map_width + 11, 14),
+            (inset_x + map_width + 11, output_height - 15),
+            color=(87, 124, 187),
+            thickness=2,
+            lineType=cv2.LINE_AA,
+        )
+    return canvas
+
+
+def resolve_inference_checkpoint_model_state(
+    *,
+    checkpoint_state_dict,
+    expected_state_dict,
+) -> tuple[dict, list[str], list[str]]:
+    compatible_state_dict: dict = {}
+    skipped_keys: list[str] = []
+    critical_keys: list[str] = []
+
+    for key, expected_value in expected_state_dict.items():
+        if key not in checkpoint_state_dict:
+            if _is_inference_policy_state_key(key):
+                critical_keys.append(key)
+            continue
+
+        checkpoint_value = checkpoint_state_dict[key]
+        expected_shape = tuple(getattr(expected_value, "shape", ()))
+        checkpoint_shape = tuple(getattr(checkpoint_value, "shape", ()))
+        if expected_shape != checkpoint_shape:
+            skipped_keys.append(key)
+            if _is_inference_policy_state_key(key):
+                critical_keys.append(key)
+            continue
+
+        compatible_state_dict[key] = checkpoint_value
+
+    return compatible_state_dict, skipped_keys, critical_keys
 
 
 def compose_recording_frame(
@@ -768,6 +852,70 @@ def _estimate_grid_spacing(values: np.ndarray, *, default: float) -> float:
     if positive_diffs.size == 0:
         return float(default)
     return float(np.median(positive_diffs))
+
+
+def _is_inference_policy_state_key(key: str) -> bool:
+    return key == "std" or key.startswith("actor.") or key.startswith("encoders.")
+
+
+def _focus_route_map_tiles(
+    origins: np.ndarray,
+    *,
+    tile_wall_edges,
+    current_position_xy,
+    route_waypoints_xy: list[list[float]] | list[tuple[float, float]] | None,
+    tile_size_x: float,
+    tile_size_y: float,
+):
+    focus_points: list[np.ndarray] = [np.asarray(current_position_xy, dtype=np.float32).reshape(2)]
+    if route_waypoints_xy:
+        focus_points.append(np.asarray(route_waypoints_xy, dtype=np.float32).reshape(-1, 2))
+    if not focus_points:
+        return origins, tile_wall_edges
+
+    stacked_points = np.concatenate([points.reshape(-1, 2) for points in focus_points], axis=0)
+    focus_bounds = (
+        float(stacked_points[:, 0].min() - tile_size_x * 0.55),
+        float(stacked_points[:, 0].max() + tile_size_x * 0.55),
+        float(stacked_points[:, 1].min() - tile_size_y * 0.55),
+        float(stacked_points[:, 1].max() + tile_size_y * 0.55),
+    )
+
+    tile_min_x = origins[..., 0] - tile_size_x * 0.5
+    tile_max_x = origins[..., 0] + tile_size_x * 0.5
+    tile_min_y = origins[..., 1] - tile_size_y * 0.5
+    tile_max_y = origins[..., 1] + tile_size_y * 0.5
+    active_tiles = (
+        (tile_max_x >= focus_bounds[0])
+        & (tile_min_x <= focus_bounds[1])
+        & (tile_max_y >= focus_bounds[2])
+        & (tile_min_y <= focus_bounds[3])
+    )
+    if not np.any(active_tiles):
+        return origins, tile_wall_edges
+
+    active_rows = np.where(active_tiles.any(axis=1))[0]
+    active_cols = np.where(active_tiles.any(axis=0))[0]
+    row_start = int(active_rows[0])
+    row_stop = int(active_rows[-1]) + 1
+    col_start = int(active_cols[0])
+    col_stop = int(active_cols[-1]) + 1
+    focused_origins = origins[row_start:row_stop, col_start:col_stop]
+    if tile_wall_edges is None:
+        return focused_origins, None
+    focused_walls = [list(row[col_start:col_stop]) for row in tile_wall_edges[row_start:row_stop]]
+    return focused_origins, focused_walls
+
+
+def _build_route_map_canvas(*, image_size: tuple[int, int]) -> np.ndarray:
+    height, width = image_size
+    top_color = np.array([247, 249, 252], dtype=np.float32)
+    bottom_color = np.array([233, 238, 244], dtype=np.float32)
+    canvas = np.zeros((height, width, 3), dtype=np.uint8)
+    for row in range(height):
+        alpha = 0.0 if height <= 1 else float(row) / float(height - 1)
+        canvas[row, :] = np.round((1.0 - alpha) * top_color + alpha * bottom_color).astype(np.uint8)
+    return canvas
 
 
 def _expand_xy_bounds(bounds: tuple[float, float, float, float], *, min_padding: float) -> tuple[float, float, float, float]:
