@@ -285,6 +285,20 @@ python scripts/instinct_rl/train.py --headless --task=Instinct-Parkour-Target-Am
 python scripts/instinct_rl/play_depth.py --task=Instinct-Parkour-Target-Amp-G1-v0 --load_run=<run_name>
 ```
 
+4. Export the trained policy to ONNX and validate it through the same play entrypoint:
+
+```bash
+python scripts/instinct_rl/play_depth.py \
+    --task=Instinct-Parkour-Target-Amp-G1-v0 \
+    --load_run=<run_name> \
+    --exportonnx \
+    --useonnx
+```
+
+The exported model is written under the selected run's `exported/` directory. `--exportonnx` writes the ONNX artifact,
+and `--useonnx` immediately switches play-time inference to the exported model so you can do a quick sanity check with
+the same command.
+
 Recommended interactive depth-debug, route-recording, and video command:
 
 ```bash
