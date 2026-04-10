@@ -37,6 +37,7 @@ from play_runtime import (
 )
 
 import cli_args  # isort: skip
+from onnxer import export_parkour_actor_critic_as_onnx, load_parkour_onnx_model
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play an RL agent with Instinct-RL.")
@@ -51,6 +52,7 @@ parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--exportonnx", action="store_true", default=False, help="Export policy as ONNX model.")
 parser.add_argument("--useonnx", action="store_true", default=False, help="Use the exported ONNX model for inference.")
+parser.add_argument("--onnx_provider", type=str, default="cpu", choices=("cpu", "cuda"), help="ONNX Runtime provider used when --useonnx is enabled.")
 parser.add_argument("--debug", action="store_true", default=False, help="Enable debug mode.")
 parser.add_argument("--no_resume", default=None, action="store_true", help="Force play in no resume mode.")
 # custom play arguments
@@ -68,6 +70,13 @@ cli_args.add_instinct_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if (args_cli.exportonnx or args_cli.useonnx) and args_cli.num_envs != 1:
+    requested_num_envs = args_cli.num_envs
+    args_cli.num_envs = 1
+    print(
+        "[INFO] ONNX export/inference requires single-environment play;"
+        f" overriding --num_envs from {requested_num_envs} to 1."
+    )
 validate_isaacsim_python_environment()
 
 
@@ -763,18 +772,15 @@ def main():
             export_model_dir = os.path.join(log_dir, "exported")
             if args_cli.exportonnx:
                 assert env.unwrapped.num_envs == 1, "Exporting to ONNX is only supported for single environment."
-                if not os.path.exists(export_model_dir):
-                    os.makedirs(export_model_dir)
                 obs, _ = env.get_observations()
-                ppo_runner.alg.actor_critic.export_as_onnx(obs, export_model_dir)
+                export_parkour_actor_critic_as_onnx(ppo_runner.alg.actor_critic, obs, export_model_dir)
 
         # use the exported model for inference
         if args_cli.useonnx:
-            from onnxer import load_parkour_onnx_model
-
             # NOTE: This is only applicable with parkour task
             onnx_policy = load_parkour_onnx_model(
                 model_dir=os.path.join(log_dir, "exported"),
+                provider=args_cli.onnx_provider,
                 get_subobs_func=lambda obs: get_subobs_by_components(
                     obs,
                     agent_cfg.policy.encoder_configs.depth_encoder.component_names,

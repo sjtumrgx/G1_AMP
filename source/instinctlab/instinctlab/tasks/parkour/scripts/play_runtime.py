@@ -377,8 +377,8 @@ def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConf
 
 def build_default_tracking_camera_specs() -> list[TrackingCameraSpec]:
     return [
-        TrackingCameraSpec("hero", eye_offset=(-3.4, -1.1, 1.45), target_offset=(0.9, 0.0, 0.42)),
-        TrackingCameraSpec("side", eye_offset=(0.15, -3.3, 1.35), target_offset=(0.8, 0.0, 0.48)),
+        TrackingCameraSpec("hero", eye_offset=(-3.4, -1.1, 1.45), target_offset=(0.9, 0.0, 0.32)),
+        TrackingCameraSpec("side", eye_offset=(0.15, -3.3, 1.35), target_offset=(0.8, 0.0, 0.4)),
         TrackingCameraSpec("overview", eye_offset=(-1.0, 0.0, 5.5), target_offset=(1.0, 0.0, 0.7)),
     ]
 
@@ -1100,7 +1100,12 @@ def _should_disable_auto_reset(options) -> bool:
 
 
 def _should_use_single_env_play(options) -> bool:
-    return bool(getattr(options, "keyboard_control", False) or getattr(options, "replay_route", None))
+    return bool(
+        getattr(options, "keyboard_control", False)
+        or getattr(options, "replay_route", None)
+        or getattr(options, "exportonnx", False)
+        or getattr(options, "useonnx", False)
+    )
 
 
 def _ensure_rgb_uint8(frame) -> np.ndarray:

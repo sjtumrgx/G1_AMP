@@ -8,6 +8,7 @@ from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply_inverse
 
 if TYPE_CHECKING:
+    from isaaclab.assets import RigidObject
     from isaaclab.envs import ManagerBasedRLEnv
 
 

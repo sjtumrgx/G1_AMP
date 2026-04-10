@@ -357,6 +357,28 @@ def test_prepare_play_env_cfg_sets_seed_and_single_env_for_route_replay():
     assert env_cfg.terminations.time_out is None
 
 
+def test_prepare_play_env_cfg_sets_single_env_for_onnx_play():
+    module = load_module()
+    env_cfg = make_fake_env_cfg()
+    options = SimpleNamespace(
+        disable_auto_reset=False,
+        show_depth_window=False,
+        show_depth_coverage=False,
+        show_command_arrow=False,
+        center_spawn=False,
+        keyboard_control=False,
+        replay_route=None,
+        exportonnx=True,
+        useonnx=True,
+    )
+
+    module.prepare_play_env_cfg(env_cfg, options, seed=123)
+
+    assert env_cfg.seed == 123
+    assert env_cfg.scene.num_envs == 1
+    assert env_cfg.episode_length_s == module.NO_AUTO_RESET_EPISODE_LENGTH_S
+
+
 def test_prepare_play_env_cfg_injects_precomputed_tile_wall_edges_from_route_artifact():
     module = load_module()
     env_cfg = make_fake_env_cfg()

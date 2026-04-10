@@ -279,6 +279,41 @@ If task imports succeed but rollouts fail immediately, separate platform problem
 python scripts/instinct_rl/train.py --headless --task=Instinct-Parkour-Target-Amp-G1-v0
 ```
 
+Multi-GPU distributed training is launched through `torchrun`. In the current training script, `--num_envs`
+is applied per rank / per GPU rather than globally, so `--nproc_per_node=4 --num_envs 4096` means roughly
+`4096 * 4` total environments. If you scale GPUs up this way, a reasonable first approximation is to reduce
+`--max_iterations` proportionally to keep the total sampled environment steps similar.
+
+Example 4-GPU launch:
+
+```bash
+conda run -n instinct51 \
+torchrun --nproc_per_node=4 scripts/instinct_rl/train.py \
+    --headless \
+    --task=Instinct-Parkour-Target-Amp-G1-v0 \
+    --num_envs=4096 \
+    --max_iterations=7500
+```
+
+The example above assumes a single-GPU baseline of `--num_envs=4096 --max_iterations=30000`. The `7500`
+iteration count is an approximate `1/4` scaling rule, not a strict guarantee of identical PPO behavior.
+
+Quick comparison:
+
+| Mode | Launch | Effective total envs | Example iterations |
+| --- | --- | --- | --- |
+| Single GPU | `conda run -n instinct51 python scripts/instinct_rl/train.py --headless --task=Instinct-Parkour-Target-Amp-G1-v0 --num_envs=4096 --max_iterations=30000` | `4096` | `30000` |
+| 4 GPUs | `conda run -n instinct51 torchrun --nproc_per_node=4 scripts/instinct_rl/train.py --headless --task=Instinct-Parkour-Target-Amp-G1-v0 --num_envs=4096 --max_iterations=7500` | `4096 * 4` | `7500` |
+
+Here `--num_envs` is interpreted per rank / per GPU by the current training entrypoint.
+
+General scaling rule for `N` GPUs:
+
+- keep `--num_envs` as the **per-GPU** environment count
+- total environments become approximately `num_envs * N`
+- use `max_iterations_new ≈ max_iterations_single_gpu / N` as a first pass
+- treat this as a sampling-equivalent heuristic for PPO, not a guarantee of identical learning dynamics
+
 3. Play a trained policy:
 
 ```bash

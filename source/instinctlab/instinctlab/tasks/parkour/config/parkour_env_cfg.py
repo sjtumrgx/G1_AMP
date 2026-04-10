@@ -30,11 +30,8 @@ from instinctlab.sensors import Grid3dPointsGeneratorCfg, NoisyGroupedRayCasterC
 from instinctlab.terrains import FiledTerrainGeneratorCfg, GreedyconcatEdgeCylinderCfg, TerrainImporterCfg
 from instinctlab.utils.noise import (
     CropAndResizeCfg,
-    DepthArtifactNoiseCfg,
     DepthNormalizationCfg,
     GaussianBlurNoiseCfg,
-    RandomGaussianNoiseCfg,
-    RangeBasedGaussianNoiseCfg,
 )
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
@@ -90,7 +87,7 @@ ROUGH_TERRAINS_CFG = FiledTerrainGeneratorCfg(
         ),
         "square_gaps": terrain_gen.PerlinSquareGapTerrainCfg(
             proportion=0.10,
-            gap_distance_range=(0.1, 0.5),
+            gap_distance_range=(0.1, 0.7),
             gap_depth=(0.4, 0.6),
             platform_width=2.5,
             border_width=1.0,
