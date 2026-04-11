@@ -15,7 +15,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.sensors.ray_caster.patterns import PinholeCameraPatternCfg
-from isaaclab.terrains import FlatPatchSamplingCfg
+from isaaclab.terrains import FlatPatchSamplingCfg, TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -27,11 +27,14 @@ from instinctlab.assets.unitree_g1 import beyondmimic_action_scale
 from instinctlab.managers import MultiRewardCfg
 from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.sensors import Grid3dPointsGeneratorCfg, NoisyGroupedRayCasterCameraCfg, VolumePointsCfg
-from instinctlab.terrains import FiledTerrainGeneratorCfg, GreedyconcatEdgeCylinderCfg, TerrainImporterCfg
+from instinctlab.terrains import GreedyconcatEdgeCylinderCfg, TerrainImporterCfg
 from instinctlab.utils.noise import (
     CropAndResizeCfg,
+    DepthArtifactNoiseCfg,
     DepthNormalizationCfg,
     GaussianBlurNoiseCfg,
+    RandomGaussianNoiseCfg,
+    RangeBasedGaussianNoiseCfg,
 )
 
 __file_dir__ = os.path.dirname(os.path.realpath(__file__))
@@ -39,7 +42,7 @@ __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 ##
 # Scene definition
 ##
-ROUGH_TERRAINS_CFG = FiledTerrainGeneratorCfg(
+ROUGH_TERRAINS_CFG = TerrainGeneratorCfg(
     seed=0,
     size=(8.0, 8.0),
     border_width=3,
@@ -311,7 +314,6 @@ class SceneCfg(InteractiveSceneCfg):
     )
     # robots
     robot: ArticulationCfg = MISSING
-    robot_reference: ArticulationCfg = None
     # sensors
     left_height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/left_ankle_roll_link",

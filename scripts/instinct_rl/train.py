@@ -14,6 +14,7 @@ import sys
 
 from isaaclab.app import AppLauncher
 
+# local imports
 import cli_args  # isort: skip
 
 
@@ -130,9 +131,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
-    terrain_generator = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
-    if terrain_generator is not None:
-        terrain_generator.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
 
     # prepare configs for distributed training
@@ -145,8 +143,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         auto_affinity()
         local_rank, world_size = dist.get_rank(), dist.get_world_size()
         env_cfg.seed += local_rank
-        if terrain_generator is not None:
-            terrain_generator.seed = env_cfg.seed
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
         agent_cfg.device = f"cuda:{app_launcher.local_rank}"
         print(

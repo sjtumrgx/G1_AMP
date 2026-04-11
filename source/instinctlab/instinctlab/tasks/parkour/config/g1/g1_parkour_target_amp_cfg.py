@@ -1,18 +1,19 @@
 import copy
 import os
 
-import isaaclab.sim as sim_utils
 from isaaclab.envs import ViewerCfg
 from isaaclab.utils import configclass
 
+import instinctlab.tasks.parkour.mdp as mdp
 from instinctlab.assets.unitree_g1 import (
     G1_29DOF_LINKS,
     G1_29DOF_TORSOBASE_POPSICLE_CFG,
     G1_29Dof_TorsoBase_symmetric_augmentation_joint_mapping,
     G1_29Dof_TorsoBase_symmetric_augmentation_joint_reverse_buf,
+    beyondmimic_g1_29dof_actuators,
     beyondmimic_g1_29dof_delayed_actuators,
 )
-from instinctlab.motion_reference import MotionReferenceManagerCfg, NoCollisionPropertiesCfg
+from instinctlab.motion_reference import MotionReferenceManagerCfg
 from instinctlab.motion_reference.motion_files.amass_motion_cfg import AmassMotionCfg as AmassMotionCfgBase
 from instinctlab.motion_reference.utils import motion_interpolate_bilinear
 from instinctlab.sensors import get_link_prim_targets
@@ -22,13 +23,6 @@ __file_dir__ = os.path.dirname(os.path.realpath(__file__))
 G1_CFG = copy.deepcopy(G1_29DOF_TORSOBASE_POPSICLE_CFG)
 G1_CFG.spawn.merge_fixed_joints = True
 G1_CFG.init_state.pos = (0.0, 0.0, 0.9)
-G1_REFERENCE_CFG = copy.deepcopy(G1_CFG)
-G1_REFERENCE_CFG.spawn.collision_props = NoCollisionPropertiesCfg()
-G1_REFERENCE_CFG.spawn.visual_material = sim_utils.PreviewSurfaceCfg(
-    diffuse_color=(0.2, 0.95, 0.8),
-    opacity=0.2,
-)
-G1_REFERENCE_CFG.init_state.pos = (0.0, 0.0, -10.0)
 G1_with_shoe_CFG = copy.deepcopy(G1_CFG)
 G1_with_shoe_CFG.spawn.asset_path = os.path.abspath(
     f"{__file_dir__}/../../urdf/g1_29dof_torsoBase_popsicle_with_shoe.urdf"
@@ -37,9 +31,9 @@ G1_with_shoe_CFG.spawn.asset_path = os.path.abspath(
 
 @configclass
 class AmassMotionCfg(AmassMotionCfgBase):
-    path = os.path.expanduser("/home/eilab/instinctlab/data/data&model/parkour_motion_reference")
+    path = os.path.expanduser("~/Datasets")
     retargetting_func = None
-    filtered_motion_selection_filepath = os.path.expanduser("/home/eilab/instinctlab/data/data&model/parkour_motion_reference/parkour_motion_without_run.yaml")
+    filtered_motion_selection_filepath = os.path.expanduser("~/Datasets/parkour_motion_without_run.yaml")
     motion_start_from_middle_range = [0.0, 0.9]
     motion_start_height_offset = 0.0
     ensure_link_below_zero_ground = False
@@ -77,22 +71,8 @@ motion_reference_cfg = MotionReferenceManagerCfg(
         "left_ankle_roll_link",
         "right_ankle_roll_link",
     ],
-    # Keep all motion trajectories visible to every distributed rank.
-    # The parkour task is often trained with a single motion file, and
-    # round-robin splitting can leave some ranks with zero trajectories.
-    mp_split_method="None",
+    mp_split_method="Even",
 )
-
-
-@configclass
-class ParkourPlayVisualizationCfg:
-    depth_window: bool = True
-    depth_coverage: bool = True
-    normals_panel: bool = True
-    route_overlay: bool = True
-    foot_contact_overlay: bool = True
-    ghost_reference: bool = False
-    obstacle_edges: bool = True
 
 
 ROUGH_TERRAINS_CFG_PLAY = copy.deepcopy(ROUGH_TERRAINS_CFG)
@@ -108,15 +88,13 @@ class G1ParkourRoughEnvCfg(ParkourEnvCfg):
         # Scene
         self.scene.terrain.terrain_generator = ROUGH_TERRAINS_CFG
         self.scene.robot = G1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
-        self.scene.robot_reference = G1_REFERENCE_CFG.replace(prim_path="{ENV_REGEX_NS}/RobotReference")
         self.scene.robot.actuators = beyondmimic_g1_29dof_delayed_actuators
         self.scene.camera.mesh_prim_paths.extend(get_link_prim_targets(G1_29DOF_LINKS))
         self.scene.motion_reference = motion_reference_cfg
-        self.play_visualization = ParkourPlayVisualizationCfg()
 
 
 class ShoeConfigMixin:
-    def apply_shoe_config(self: ParkourEnvCfg):
+    def apply_shoe_config(self):
         self.scene.robot = G1_with_shoe_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.leg_volume_points.points_generator.z_min = -0.063
         self.scene.leg_volume_points.points_generator.z_max = -0.023
