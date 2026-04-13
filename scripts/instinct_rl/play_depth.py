@@ -12,6 +12,7 @@ sys.path.append(os.path.join(os.getcwd(), "source", "instinctlab", "instinctlab"
 from isaaclab.app import AppLauncher
 from play_runtime import (
     DEPTH_WINDOW_NAME,
+    ELEVATION_MAP_WINDOW_NAME,
     NORMALS_WINDOW_NAME,
     add_play_runtime_args,
     build_play_video_output_path,
@@ -21,9 +22,12 @@ from play_runtime import (
     compose_recording_frame,
     compute_tracking_camera_views,
     create_keyboard_event_subscription,
+    create_rolling_elevation_map,
     ensure_sensor_initialized,
+    integrate_elevation_map_observations,
     normalize_depth_frame_for_display,
     normalize_normals_frame_for_display,
+    render_elevation_map_panel,
     prepare_play_env_cfg,
     resolve_inference_checkpoint_model_state,
     resolve_play_visualization_config,
@@ -230,6 +234,19 @@ def _read_normals_panel(env) -> np.ndarray | None:
         return None
     normals_frame = outputs["normals"][0].detach().cpu().numpy()
     return normalize_normals_frame_for_display(normals_frame)
+
+
+def _read_camera_ray_hits(env) -> np.ndarray | None:
+    camera_sensor = env.unwrapped.scene.sensors["camera"]
+    ray_hits = getattr(camera_sensor, "ray_hits_w", None)
+    if ray_hits is None:
+        ray_hits = getattr(camera_sensor.data, "ray_hits_w", None)
+    if ray_hits is None:
+        return None
+    ray_hits_env0 = ray_hits[0]
+    if hasattr(ray_hits_env0, "detach"):
+        return ray_hits_env0.detach().cpu().numpy()
+    return np.asarray(ray_hits_env0, dtype=np.float32)
 
 
 def _log_depth_input_design(env_cfg) -> None:
@@ -465,6 +482,7 @@ class PlayCaptureRig:
         video_fps: float,
         video_frame_stride: int,
         show_depth_window: bool,
+        show_elevation_map_window: bool,
         show_normals_panel: bool,
         video_layout: str,
         route_map_waypoints_xy: list[list[float]] | list[tuple[float, float]] | None = None,
@@ -478,6 +496,7 @@ class PlayCaptureRig:
         self.video_fps = video_fps
         self.video_frame_stride = video_frame_stride
         self.show_depth_window = show_depth_window
+        self.show_elevation_map_window = show_elevation_map_window
         self.show_normals_panel = show_normals_panel
         self.video_layout = video_layout
         self.frames_written = 0
@@ -485,11 +504,14 @@ class PlayCaptureRig:
         self._preview_window_names = []
         if self.show_depth_window:
             self._preview_window_names.append(DEPTH_WINDOW_NAME)
+        if self.show_elevation_map_window:
+            self._preview_window_names.append(ELEVATION_MAP_WINDOW_NAME)
         if self.show_normals_panel:
             self._preview_window_names.append(NORMALS_WINDOW_NAME)
         self._disabled_preview_windows: set[str] = set()
         self.route_map_waypoints_xy = [list(point) for point in route_map_waypoints_xy] if route_map_waypoints_xy else None
         self.route_map_tile_wall_edges = route_map_tile_wall_edges
+        self._elevation_map_state = create_rolling_elevation_map() if self.show_elevation_map_window else None
         self._camera_specs = build_default_tracking_camera_specs() if output_path is not None else []
         self._cameras: dict[str, Camera] = {}
         self._camera_resolution = resolve_recording_camera_resolution(video_layout)
@@ -519,8 +541,9 @@ class PlayCaptureRig:
 
     def capture(self, timestep: int) -> None:
         depth_panel = _read_depth_panel(self.env, self.env_cfg)
+        elevation_map_panel = self._build_elevation_map_panel() if self.show_elevation_map_window else None
         normals_panel = _read_normals_panel(self.env) if self.show_normals_panel else None
-        self._show_preview_windows(depth_panel, normals_panel)
+        self._show_preview_windows(depth_panel, elevation_map_panel, normals_panel)
 
         if self.output_path is None or timestep < self.video_start_step or self.is_complete:
             return
@@ -626,11 +649,18 @@ class PlayCaptureRig:
         self.env.unwrapped.sim.render()
         ensure_sensor_initialized(camera, sensor_name=camera.cfg.prim_path)
 
-    def _show_preview_windows(self, depth_panel: np.ndarray, normals_panel: np.ndarray | None) -> None:
+    def _show_preview_windows(
+        self,
+        depth_panel: np.ndarray,
+        elevation_map_panel: np.ndarray | None,
+        normals_panel: np.ndarray | None,
+    ) -> None:
         preview_panels = build_live_preview_panels(
             depth_panel=depth_panel,
+            elevation_map_panel=elevation_map_panel,
             normals_panel=normals_panel,
             show_depth_window=self.show_depth_window,
+            show_elevation_map_window=self.show_elevation_map_window,
             show_normals_window=self.show_normals_panel,
         )
         if not preview_panels:
@@ -661,6 +691,24 @@ class PlayCaptureRig:
             route_waypoints_xy=self.route_map_waypoints_xy,
             tile_wall_edges=self.route_map_tile_wall_edges,
             image_size=(720, 720),
+        )
+
+    def _build_elevation_map_panel(self) -> np.ndarray | None:
+        if self._elevation_map_state is None:
+            return None
+        ray_hits_w = _read_camera_ray_hits(self.env)
+        if ray_hits_w is None:
+            return None
+        root_position, root_yaw = _read_root_state(self.env)
+        integrate_elevation_map_observations(
+            self._elevation_map_state,
+            ray_hits_w,
+            robot_position_xy=root_position[:2],
+        )
+        return render_elevation_map_panel(
+            self._elevation_map_state,
+            robot_position_xy=root_position[:2],
+            robot_yaw=root_yaw,
         )
 
 
@@ -719,6 +767,7 @@ def main():
     args_cli.visualization = resolve_play_visualization_config(env_cfg, args_cli)
     args_cli.show_depth_window = args_cli.visualization.depth_window
     args_cli.show_depth_coverage = args_cli.visualization.depth_coverage
+    args_cli.show_elevation_map_window = args_cli.visualization.elevation_map_window
     args_cli.normals_panel = args_cli.visualization.normals_panel
     args_cli.route_overlay = args_cli.visualization.route_overlay
     args_cli.foot_contact_overlay = args_cli.visualization.foot_contact_overlay
@@ -918,6 +967,7 @@ def main():
             video_fps=capture_settings.video_fps,
             video_frame_stride=capture_settings.frame_stride,
             show_depth_window=args_cli.show_depth_window,
+            show_elevation_map_window=args_cli.show_elevation_map_window,
             show_normals_panel=args_cli.normals_panel,
             video_layout=args_cli.video_layout,
             route_map_waypoints_xy=None if route_artifact is None else route_artifact.waypoints_xy,

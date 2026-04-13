@@ -347,6 +347,7 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --video \
     --show_depth_window \
     --show_depth_coverage \
+    --show_elevation_map_window \
     --disable_auto_reset \
     --video_duration_s 300
 ```
@@ -361,38 +362,38 @@ What this command does:
 - `--video`: enables video recording.
 - `--show_depth_window`: opens a live depth preview window.
 - `--show_depth_coverage`: shows the raw camera coverage footprint in the RGB scene.
+- `--show_elevation_map_window`: opens a robot-centered rolling elevation-map window that preserves seen terrain and leaves unseen cells blank.
 - `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
 - `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
 
 ### Parkour Play Visualization Modules
 
-The parkour play path has a centralized visualization-default block at:
+`scripts/instinct_rl/play_depth.py` resolves play-visualization behavior through
+`resolve_play_visualization_config()` in
+`source/instinctlab/instinctlab/tasks/parkour/scripts/play_runtime.py`.
 
-- `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py`
-- class: `ParkourPlayVisualizationCfg`
+Current behavior:
 
-The seven visualization toggles in that config are:
+- `play_runtime.py` supports an optional `env_cfg.play_visualization` namespace plus per-run CLI overrides.
+- The current G1 parkour config does **not** define play-visualization defaults, so the CLI flags below are the normal entry point unless you add your own `play_visualization` block.
+- These flags use `argparse.BooleanOptionalAction`, so each toggle supports both enable and disable forms.
+
+The eight visualization toggles are:
 
 - `depth_window`
 - `depth_coverage`
+- `elevation_map_window`
 - `normals_panel`
 - `route_overlay`
 - `foot_contact_overlay`
 - `ghost_reference`
 - `obstacle_edges`
 
-At runtime, `scripts/instinct_rl/play_depth.py` resolves these defaults through `resolve_play_visualization_config()` in `source/instinctlab/instinctlab/tasks/parkour/scripts/play_runtime.py`.
-
-Precedence rules:
-
-- First set your default behavior in `ParkourPlayVisualizationCfg`.
-- Then override per run from the CLI.
-- These flags use `argparse.BooleanOptionalAction`, so each toggle supports both enable and disable forms.
-
 CLI override forms:
 
 - `--show_depth_window` / `--no-show_depth_window`
 - `--show_depth_coverage` / `--no-show_depth_coverage`
+- `--show_elevation_map_window` / `--no-show_elevation_map_window`
 - `--normals_panel` / `--no-normals_panel`
 - `--route_overlay` / `--no-route_overlay`
 - `--foot_contact_overlay` / `--no-foot_contact_overlay`
@@ -402,7 +403,7 @@ CLI override forms:
 Examples:
 
 ```bash
-# Enable all seven visualizations for one run
+# Enable all eight visualizations for one run
 OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --task=Instinct-Parkour-Target-Amp-G1-v0 \
     --load_run=20260327_163647 \
@@ -410,27 +411,26 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --video \
     --show_depth_window \
     --show_depth_coverage \
+    --show_elevation_map_window \
     --normals_panel \
     --route_overlay \
     --foot_contact_overlay \
     --ghost_reference \
     --obstacle_edges
 
-# Start from config defaults, but disable just the ghost
+# Start from defaults, but enable only the new elevation map window explicitly
 OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --task=Instinct-Parkour-Target-Amp-G1-v0 \
     --load_run=20260327_163647 \
-    --no-ghost_reference
+    --show_elevation_map_window
 ```
 
 #### 1. `depth_window`
 
 - Purpose: opens a live OpenCV depth preview window named `parkour_depth`.
 - Enable:
-  - config: `depth_window = True`
   - CLI: `--show_depth_window`
 - Disable:
-  - config: `depth_window = False`
   - CLI: `--no-show_depth_window`
 - Where it appears:
   - live interactive preview window only
@@ -445,10 +445,8 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
 
 - Purpose: draws the raw grouped ray-caster field-of-view coverage into the 3D scene.
 - Enable:
-  - config: `depth_coverage = True`
   - CLI: `--show_depth_coverage`
 - Disable:
-  - config: `depth_coverage = False`
   - CLI: `--no-show_depth_coverage`
 - What it shows:
   - the raw camera coverage footprint, not the final cropped policy depth tensor
@@ -457,14 +455,36 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
   - policy crop from `scene.camera.noise_pipeline.crop_and_resize.crop_region`
   - camera extrinsics / placement from the parkour scene camera config in `parkour_env_cfg.py`
 
-#### 3. `normals_panel`
+#### 3. `elevation_map_window`
+
+- Purpose: opens a live OpenCV elevation-map preview window named `parkour_elevation_map`.
+- Enable:
+  - CLI: `--show_elevation_map_window`
+- Disable:
+  - CLI: `--no-show_elevation_map_window`
+- What it shows:
+  - a **robot-centered, world-aligned local memory view** built from observed `camera.ray_hits_w`
+  - seen cells are retained over time inside a bounded local map
+  - unseen cells intentionally remain blank in v1
+- Main behavior:
+  - the current implementation stores the maximum finite `z` observed per XY cell
+  - the local crop stays world-aligned while robot yaw is shown with a heading arrow
+  - this is a lightweight debug map, not full `elevation_mapping` parity and not a guaranteed walkable-surface reconstruction
+- Where it appears:
+  - live interactive preview window only in v1
+  - it is **not** added to the recorded composite video layout in the current implementation
+- Main tunables:
+  - current defaults are code-level in `RollingElevationMapConfig` inside `play_runtime.py`
+  - current preview image size is `240 x 240`
+  - current map resolution is `0.1 m`
+  - current map span is `6.0 m x 6.0 m`
+
+#### 4. `normals_panel`
 
 - Purpose: shows a false-color surface-normal visualization from the same ray-caster camera.
 - Enable:
-  - config: `normals_panel = True`
   - CLI: `--normals_panel`
 - Disable:
-  - config: `normals_panel = False`
   - CLI: `--no-normals_panel`
 - Where it appears:
   - live OpenCV window named `parkour_normals`
@@ -474,14 +494,12 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
   - preview scale is shared with the depth window via `build_live_preview_panels(scale=8.0)`
   - false-color conversion is handled by `normalize_normals_frame_for_display()` in `play_runtime.py`
 
-#### 4. `route_overlay`
+#### 5. `route_overlay`
 
 - Purpose: draws route-following diagnostics in the 3D scene.
 - Enable:
-  - config: `route_overlay = True`
   - CLI: `--route_overlay`
 - Disable:
-  - config: `route_overlay = False`
   - CLI: `--no-route_overlay`
 - What it shows:
   - the exact saved route polyline in amber
@@ -498,14 +516,12 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     - `prediction_horizon_s=1.0`
     - `prediction_samples=20`
 
-#### 5. `foot_contact_overlay`
+#### 6. `foot_contact_overlay`
 
 - Purpose: visualizes foot contact forces and touchdown events.
 - Enable:
-  - config: `foot_contact_overlay = True`
   - CLI: `--foot_contact_overlay`
 - Disable:
-  - config: `foot_contact_overlay = False`
   - CLI: `--no-foot_contact_overlay`
 - What it shows:
   - red arrows for active foot contact forces
@@ -517,14 +533,12 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     - `force_threshold=1.0`
     - `force_scale=0.0025`
 
-#### 6. `ghost_reference`
+#### 7. `ghost_reference`
 
 - Purpose: shows the motion-reference robot as a side-by-side visual ghost for qualitative comparison.
 - Enable:
-  - config: `ghost_reference = True`
   - CLI: `--ghost_reference`
 - Disable:
-  - config: `ghost_reference = False`
   - CLI: `--no-ghost_reference`
 - What play mode does when enabled:
   - turns on `motion_reference.debug_vis`
@@ -537,14 +551,12 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
   - `motion_reference.visualizing_marker_types`
   - these live in the motion-reference config used by the parkour task
 
-#### 7. `obstacle_edges`
+#### 8. `obstacle_edges`
 
 - Purpose: highlights obstacle boundaries and terrain-generated wall edges in the scene.
 - Enable:
-  - config: `obstacle_edges = True`
   - CLI: `--obstacle_edges`
 - Disable:
-  - config: `obstacle_edges = False`
   - CLI: `--no-obstacle_edges`
 - What it shows:
   - the terrain / obstacle edge debug representation registered from the terrain metadata
@@ -569,11 +581,12 @@ When `--video_layout quad` is active, the composite recorder uses a 3x2 grid onc
 - Sixth panel:
   - `Route Map` during replay video capture when a route artifact is loaded
 
-The `Route Map` panel is an automatically generated debug view of the replay route, terrain tile layout, wall edges, map center, and current robot pose. It is not one of the seven top-level play-visualization toggles, but it fills the sixth composite slot during replay recording so the grid is no longer padded with an empty panel.
+The `Route Map` panel is an automatically generated debug view of the replay route, terrain tile layout, wall edges, map center, and current robot pose. It is not one of the eight top-level play-visualization toggles, but it fills the sixth composite slot during replay recording so the grid is no longer padded with an empty panel.
 
 Notes:
 
 - The red coverage visualization shows the raw grouped ray-caster field of view. The policy depth observation is still a cropped lower-center patch after preprocessing.
+- The elevation-map window is a world-aligned local memory view centered on the robot: seen cells are retained over time, while unseen cells intentionally remain blank in v1.
 - Keyboard commands during play are:
   - `W`: increase forward command
   - `F`: positive yaw

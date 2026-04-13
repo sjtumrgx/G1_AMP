@@ -1,7 +1,7 @@
 import argparse
 from datetime import datetime
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import subprocess
@@ -17,6 +17,7 @@ VIDEO_LAYOUT_CHOICES = ("quad", "single")
 ISAACSIM_REQUIRED_NUMPY_VERSION = "1.26.0"
 DEPTH_WINDOW_NAME = "parkour_depth"
 NORMALS_WINDOW_NAME = "parkour_normals"
+ELEVATION_MAP_WINDOW_NAME = "parkour_elevation_map"
 
 
 @dataclass(frozen=True)
@@ -37,11 +38,31 @@ class VideoCaptureSettings:
 class PlayVisualizationConfig:
     depth_window: bool = False
     depth_coverage: bool = False
+    elevation_map_window: bool = False
     normals_panel: bool = False
     route_overlay: bool = False
     foot_contact_overlay: bool = False
     ghost_reference: bool = False
     obstacle_edges: bool = False
+
+
+@dataclass(frozen=True)
+class RollingElevationMapConfig:
+    resolution_m: float = 0.1
+    size_m: float = 6.0
+    retention_multiplier: float = 2.0
+    image_size: tuple[int, int] = (240, 240)
+    unknown_color: tuple[int, int, int] = (0, 0, 0)
+    robot_color: tuple[int, int, int] = (14, 165, 233)
+    border_color: tuple[int, int, int] = (214, 223, 233)
+
+
+@dataclass
+class RollingElevationMapState:
+    config: RollingElevationMapConfig = field(default_factory=RollingElevationMapConfig)
+    step_count: int = 0
+    observed_height_by_cell: dict[tuple[int, int], float] = field(default_factory=dict)
+    last_seen_step_by_cell: dict[tuple[int, int], int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -85,6 +106,12 @@ def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Visualize depth ray hits in the RGB scene.",
+    )
+    parser.add_argument(
+        "--show_elevation_map_window",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show a robot-centered rolling local elevation-map preview window built from observed ray hits.",
     )
     parser.add_argument(
         "--normals_panel",
@@ -352,6 +379,10 @@ def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConf
             default=getattr(defaults, "depth_coverage", False),
             override=getattr(options, "show_depth_coverage", None),
         ),
+        elevation_map_window=_resolve_visualization_flag(
+            default=getattr(defaults, "elevation_map_window", False),
+            override=getattr(options, "show_elevation_map_window", None),
+        ),
         normals_panel=_resolve_visualization_flag(
             default=getattr(defaults, "normals_panel", False),
             override=getattr(options, "normals_panel", None),
@@ -439,17 +470,134 @@ def normalize_normals_frame_for_display(normals_frame) -> np.ndarray:
 def build_live_preview_panels(
     *,
     depth_panel: np.ndarray,
+    elevation_map_panel: np.ndarray | None = None,
     normals_panel: np.ndarray | None = None,
     show_depth_window: bool,
+    show_elevation_map_window: bool = False,
     show_normals_window: bool,
     scale: float = 8.0,
 ) -> list[tuple[str, np.ndarray]]:
     panels: list[tuple[str, np.ndarray]] = []
     if show_depth_window:
         panels.append((DEPTH_WINDOW_NAME, _resize_live_preview_panel(depth_panel, scale=scale)))
+    if show_elevation_map_window and elevation_map_panel is not None:
+        panels.append((ELEVATION_MAP_WINDOW_NAME, _resize_live_preview_panel(elevation_map_panel, scale=scale)))
     if show_normals_window and normals_panel is not None:
         panels.append((NORMALS_WINDOW_NAME, _resize_live_preview_panel(normals_panel, scale=scale)))
     return panels
+
+
+def create_rolling_elevation_map(
+    config: RollingElevationMapConfig | None = None,
+) -> RollingElevationMapState:
+    return RollingElevationMapState(config=RollingElevationMapConfig() if config is None else config)
+
+
+def integrate_elevation_map_observations(
+    state: RollingElevationMapState,
+    ray_hits_w,
+    *,
+    robot_position_xy,
+) -> None:
+    if not isinstance(state, RollingElevationMapState):
+        raise TypeError(f"Expected RollingElevationMapState, got {type(state)!r}.")
+    config = state.config
+    state.step_count += 1
+
+    observed_cells = _collapse_ray_hits_to_height_cells(ray_hits_w, resolution_m=config.resolution_m)
+    for cell_key, cell_height in observed_cells.items():
+        state.observed_height_by_cell[cell_key] = float(cell_height)
+        state.last_seen_step_by_cell[cell_key] = state.step_count
+
+    _prune_rolling_elevation_map(state, robot_position_xy=robot_position_xy)
+
+
+def render_elevation_map_panel(
+    state: RollingElevationMapState,
+    *,
+    robot_position_xy,
+    robot_yaw: float,
+) -> np.ndarray:
+    if not isinstance(state, RollingElevationMapState):
+        raise TypeError(f"Expected RollingElevationMapState, got {type(state)!r}.")
+
+    config = state.config
+    image_height, image_width = config.image_size
+    panel = np.zeros((int(image_height), int(image_width), 3), dtype=np.uint8)
+    panel[...] = np.asarray(config.unknown_color, dtype=np.uint8)
+
+    robot_xy = np.asarray(robot_position_xy, dtype=np.float32).reshape(2)
+    half_extent = float(config.size_m) * 0.5
+    bounds = (
+        float(robot_xy[0] - half_extent),
+        float(robot_xy[0] + half_extent),
+        float(robot_xy[1] - half_extent),
+        float(robot_xy[1] + half_extent),
+    )
+
+    visible_cells: list[tuple[tuple[int, int], float]] = []
+    for cell_key, cell_height in state.observed_height_by_cell.items():
+        cell_bounds = _cell_bounds_from_index(cell_key, resolution_m=config.resolution_m)
+        if _cell_intersects_bounds(cell_bounds, bounds):
+            visible_cells.append((cell_key, float(cell_height)))
+
+    if visible_cells:
+        heights = np.asarray([height for _, height in visible_cells], dtype=np.float32)
+        normalized_heights = _normalize_elevation_heights_for_display(heights)
+        colors = cv2.applyColorMap(normalized_heights[:, None], cv2.COLORMAP_TURBO)[:, 0, :]
+        for (cell_key, _), color in zip(visible_cells, colors, strict=True):
+            x_min, x_max, y_min, y_max = _cell_bounds_from_index(cell_key, resolution_m=config.resolution_m)
+            top_left = _world_xy_to_panel_pixel(
+                (x_min, y_max),
+                bounds=bounds,
+                image_size=(image_height, image_width),
+                margin=0,
+            )
+            bottom_right = _world_xy_to_panel_pixel(
+                (x_max, y_min),
+                bounds=bounds,
+                image_size=(image_height, image_width),
+                margin=0,
+            )
+            left = min(top_left[0], bottom_right[0])
+            right = max(top_left[0], bottom_right[0])
+            top = min(top_left[1], bottom_right[1])
+            bottom = max(top_left[1], bottom_right[1])
+            cv2.rectangle(
+                panel,
+                (left, top),
+                (right, bottom),
+                color=tuple(int(channel) for channel in color.tolist()),
+                thickness=-1,
+                lineType=cv2.LINE_AA,
+            )
+
+    robot_px = _world_xy_to_panel_pixel(robot_xy, bounds=bounds, image_size=(image_height, image_width), margin=0)
+    cv2.circle(panel, robot_px, 5, color=(255, 255, 255), thickness=-1, lineType=cv2.LINE_AA)
+    cv2.circle(panel, robot_px, 3, color=config.robot_color, thickness=-1, lineType=cv2.LINE_AA)
+    arrow_length_px = max(10, int(min(image_width, image_height) * 0.08))
+    heading_end = (
+        int(round(robot_px[0] + math.cos(float(robot_yaw)) * arrow_length_px)),
+        int(round(robot_px[1] - math.sin(float(robot_yaw)) * arrow_length_px)),
+    )
+    cv2.arrowedLine(
+        panel,
+        robot_px,
+        heading_end,
+        color=config.robot_color,
+        thickness=2,
+        tipLength=0.25,
+        line_type=cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        panel,
+        (0, 0),
+        (image_width - 1, image_height - 1),
+        color=config.border_color,
+        thickness=1,
+        lineType=cv2.LINE_AA,
+    )
+    return panel
 
 
 def render_route_map_panel(
@@ -787,6 +935,7 @@ def _get_play_visualization_config(options) -> PlayVisualizationConfig:
         return PlayVisualizationConfig(
             depth_window=bool(getattr(options, "show_depth_window", False)),
             depth_coverage=bool(getattr(options, "show_depth_coverage", False)),
+            elevation_map_window=bool(getattr(options, "show_elevation_map_window", False)),
             normals_panel=bool(getattr(options, "normals_panel", False)),
             route_overlay=bool(getattr(options, "route_overlay", False)),
             foot_contact_overlay=bool(getattr(options, "foot_contact_overlay", False)),
@@ -798,6 +947,7 @@ def _get_play_visualization_config(options) -> PlayVisualizationConfig:
     return PlayVisualizationConfig(
         depth_window=bool(getattr(visualization, "depth_window", False)),
         depth_coverage=bool(getattr(visualization, "depth_coverage", False)),
+        elevation_map_window=bool(getattr(visualization, "elevation_map_window", False)),
         normals_panel=bool(getattr(visualization, "normals_panel", False)),
         route_overlay=bool(getattr(visualization, "route_overlay", False)),
         foot_contact_overlay=bool(getattr(visualization, "foot_contact_overlay", False)),
@@ -975,6 +1125,88 @@ def _wall_edge_to_segment(wall: dict) -> tuple[float, float, float, float]:
         return wall_x, y, wall_x, y + height
     wall_y = y + height * 0.5
     return x, wall_y, x + width, wall_y
+
+
+def _collapse_ray_hits_to_height_cells(
+    ray_hits_w,
+    *,
+    resolution_m: float,
+) -> dict[tuple[int, int], float]:
+    points = np.asarray(ray_hits_w, dtype=np.float32).reshape(-1, 3)
+    if points.size == 0:
+        return {}
+    valid_points = points[np.isfinite(points).all(axis=1)]
+    if valid_points.size == 0:
+        return {}
+
+    cell_heights: dict[tuple[int, int], float] = {}
+    inverse_resolution = 1.0 / float(resolution_m)
+    for point_x, point_y, point_z in valid_points:
+        cell_key = (
+            int(np.floor(float(point_x) * inverse_resolution)),
+            int(np.floor(float(point_y) * inverse_resolution)),
+        )
+        previous_height = cell_heights.get(cell_key)
+        height_value = float(point_z)
+        if previous_height is None or height_value > previous_height:
+            cell_heights[cell_key] = height_value
+    return cell_heights
+
+
+def _prune_rolling_elevation_map(
+    state: RollingElevationMapState,
+    *,
+    robot_position_xy,
+) -> None:
+    if not state.observed_height_by_cell:
+        return
+    config = state.config
+    retention_radius_m = float(config.size_m) * 0.5 * float(config.retention_multiplier)
+    min_x = float(robot_position_xy[0]) - retention_radius_m
+    max_x = float(robot_position_xy[0]) + retention_radius_m
+    min_y = float(robot_position_xy[1]) - retention_radius_m
+    max_y = float(robot_position_xy[1]) + retention_radius_m
+
+    keys_to_delete = []
+    for cell_key in state.observed_height_by_cell:
+        x_min, x_max, y_min, y_max = _cell_bounds_from_index(cell_key, resolution_m=config.resolution_m)
+        if x_max < min_x or x_min > max_x or y_max < min_y or y_min > max_y:
+            keys_to_delete.append(cell_key)
+    for cell_key in keys_to_delete:
+        state.observed_height_by_cell.pop(cell_key, None)
+        state.last_seen_step_by_cell.pop(cell_key, None)
+
+
+def _cell_bounds_from_index(
+    cell_key: tuple[int, int],
+    *,
+    resolution_m: float,
+) -> tuple[float, float, float, float]:
+    cell_x, cell_y = cell_key
+    x_min = float(cell_x) * float(resolution_m)
+    y_min = float(cell_y) * float(resolution_m)
+    return (x_min, x_min + float(resolution_m), y_min, y_min + float(resolution_m))
+
+
+def _cell_intersects_bounds(
+    cell_bounds: tuple[float, float, float, float],
+    bounds: tuple[float, float, float, float],
+) -> bool:
+    x_min, x_max, y_min, y_max = cell_bounds
+    bound_min_x, bound_max_x, bound_min_y, bound_max_y = bounds
+    return not (x_max < bound_min_x or x_min > bound_max_x or y_max < bound_min_y or y_min > bound_max_y)
+
+
+def _normalize_elevation_heights_for_display(heights: np.ndarray) -> np.ndarray:
+    height_values = np.asarray(heights, dtype=np.float32).reshape(-1)
+    if height_values.size == 0:
+        return np.zeros((0,), dtype=np.uint8)
+    min_height = float(height_values.min())
+    max_height = float(height_values.max())
+    if max_height - min_height <= 1e-5:
+        return np.full(height_values.shape, 160, dtype=np.uint8)
+    normalized = (height_values - min_height) / (max_height - min_height)
+    return np.clip(np.round(normalized * 255.0), 0.0, 255.0).astype(np.uint8)
 
 
 def _discover_single_display_active_gpu(*, command_runner) -> int | None:

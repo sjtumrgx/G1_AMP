@@ -91,6 +91,7 @@ def test_add_play_runtime_args_accepts_new_flags():
             "--disable_auto_reset",
             "--show_depth_window",
             "--show_depth_coverage",
+            "--show_elevation_map_window",
             "--normals_panel",
             "--route_overlay",
             "--foot_contact_overlay",
@@ -124,6 +125,7 @@ def test_add_play_runtime_args_accepts_new_flags():
     assert args.disable_auto_reset is True
     assert args.show_depth_window is True
     assert args.show_depth_coverage is True
+    assert args.show_elevation_map_window is True
     assert args.normals_panel is True
     assert args.route_overlay is True
     assert args.foot_contact_overlay is True
@@ -195,6 +197,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
     env_cfg.play_visualization = SimpleNamespace(
         depth_window=True,
         depth_coverage=True,
+        elevation_map_window=True,
         normals_panel=True,
         route_overlay=True,
         foot_contact_overlay=True,
@@ -204,6 +207,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
     options = SimpleNamespace(
         show_depth_window=None,
         show_depth_coverage=None,
+        show_elevation_map_window=None,
         normals_panel=None,
         route_overlay=None,
         foot_contact_overlay=None,
@@ -215,6 +219,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
 
     assert resolved.depth_window is True
     assert resolved.depth_coverage is True
+    assert resolved.elevation_map_window is True
     assert resolved.normals_panel is True
     assert resolved.route_overlay is True
     assert resolved.foot_contact_overlay is True
@@ -228,6 +233,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
     env_cfg.play_visualization = SimpleNamespace(
         depth_window=True,
         depth_coverage=True,
+        elevation_map_window=False,
         normals_panel=False,
         route_overlay=False,
         foot_contact_overlay=True,
@@ -237,6 +243,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
     options = SimpleNamespace(
         show_depth_window=False,
         show_depth_coverage=None,
+        show_elevation_map_window=True,
         normals_panel=True,
         route_overlay=True,
         foot_contact_overlay=False,
@@ -248,6 +255,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
 
     assert resolved.depth_window is False
     assert resolved.depth_coverage is True
+    assert resolved.elevation_map_window is True
     assert resolved.normals_panel is True
     assert resolved.route_overlay is True
     assert resolved.foot_contact_overlay is False
@@ -267,6 +275,7 @@ def test_apply_play_runtime_overrides_reads_visualization_namespace():
         visualization=SimpleNamespace(
             depth_window=True,
             depth_coverage=True,
+            elevation_map_window=False,
             normals_panel=False,
             route_overlay=False,
             foot_contact_overlay=False,
@@ -554,22 +563,30 @@ def test_compose_recording_frame_uses_bottom_right_slot_for_second_extra_panel()
     assert composite[4, 12].tolist() == [60, 60, 60]
 
 
-def test_build_live_preview_panels_returns_depth_and_normals_windows():
+def test_build_live_preview_panels_returns_depth_elevation_and_normals_windows():
     module = load_module()
     depth_panel = np.full((4, 6, 3), 40, dtype=np.uint8)
+    elevation_map_panel = np.full((4, 6, 3), 45, dtype=np.uint8)
     normals_panel = np.full((4, 6, 3), 50, dtype=np.uint8)
 
     panels = module.build_live_preview_panels(
         depth_panel=depth_panel,
+        elevation_map_panel=elevation_map_panel,
         normals_panel=normals_panel,
         show_depth_window=True,
+        show_elevation_map_window=True,
         show_normals_window=True,
         scale=2.0,
     )
 
-    assert [name for name, _ in panels] == [module.DEPTH_WINDOW_NAME, module.NORMALS_WINDOW_NAME]
+    assert [name for name, _ in panels] == [
+        module.DEPTH_WINDOW_NAME,
+        module.ELEVATION_MAP_WINDOW_NAME,
+        module.NORMALS_WINDOW_NAME,
+    ]
     assert panels[0][1].shape == (8, 12, 3)
     assert panels[1][1].shape == (8, 12, 3)
+    assert panels[2][1].shape == (8, 12, 3)
 
 
 def test_render_route_map_panel_draws_route_state_on_nonempty_canvas():
@@ -1056,3 +1073,137 @@ def test_detect_new_contact_events_flags_only_new_touchdowns():
     )
 
     assert events.tolist() == [True, False, False]
+
+
+def test_get_play_visualization_config_reads_namespace_elevation_window():
+    module = load_module()
+    config = module._get_play_visualization_config(
+        SimpleNamespace(
+            visualization=SimpleNamespace(
+                depth_window=False,
+                depth_coverage=False,
+                elevation_map_window=True,
+                normals_panel=False,
+                route_overlay=False,
+                foot_contact_overlay=False,
+                ghost_reference=False,
+                obstacle_edges=False,
+            )
+        )
+    )
+
+    assert config.elevation_map_window is True
+
+
+def test_get_play_visualization_config_accepts_dataclass_elevation_window():
+    module = load_module()
+    config = module._get_play_visualization_config(
+        SimpleNamespace(
+            visualization=module.PlayVisualizationConfig(elevation_map_window=True)
+        )
+    )
+
+    assert config.elevation_map_window is True
+
+
+def test_integrate_elevation_map_observations_keeps_highest_height_per_cell():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2], [0.4, 0.4, 0.8]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    assert np.isclose(state.observed_height_by_cell[(0, 0)], 0.8)
+
+
+def test_render_elevation_map_panel_preserves_seen_cells_and_unknown_space():
+    module = load_module()
+    state = module.create_rolling_elevation_map(
+        module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0, image_size=(40, 40))
+    )
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.4], [1.1, 0.1, 0.8]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+    panel = module.render_elevation_map_panel(
+        state,
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        robot_yaw=0.0,
+    )
+
+    assert panel.shape == (40, 40, 3)
+    assert np.any(np.all(panel == np.array(state.config.unknown_color, dtype=np.uint8), axis=-1))
+    assert np.unique(panel.reshape(-1, 3), axis=0).shape[0] > 3
+
+
+def test_render_elevation_map_panel_keeps_world_aligned_memory_across_yaw_only_rotation():
+    module = load_module()
+    state = module.create_rolling_elevation_map(
+        module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0, image_size=(40, 40))
+    )
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[-1.6, -1.6, 0.5]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+    panel_yaw0 = module.render_elevation_map_panel(
+        state,
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        robot_yaw=0.0,
+    )
+    panel_yaw90 = module.render_elevation_map_panel(
+        state,
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        robot_yaw=float(np.pi * 0.5),
+    )
+
+    cell_bounds = module._cell_bounds_from_index((-2, -2), resolution_m=1.0)
+    render_bounds = (-2.0, 2.0, -2.0, 2.0)
+    top_left = module._world_xy_to_panel_pixel(
+        (cell_bounds[0], cell_bounds[3]),
+        bounds=render_bounds,
+        image_size=(40, 40),
+        margin=0,
+    )
+    bottom_right = module._world_xy_to_panel_pixel(
+        (cell_bounds[1], cell_bounds[2]),
+        bounds=render_bounds,
+        image_size=(40, 40),
+        margin=0,
+    )
+    left = min(top_left[0], bottom_right[0])
+    right = max(top_left[0], bottom_right[0])
+    top = min(top_left[1], bottom_right[1])
+    bottom = max(top_left[1], bottom_right[1])
+
+    assert np.any(np.any(panel_yaw0[top : bottom + 1, left : right + 1, :] != 0, axis=-1))
+    np.testing.assert_array_equal(
+        panel_yaw0[top : bottom + 1, left : right + 1, :],
+        panel_yaw90[top : bottom + 1, left : right + 1, :],
+    )
+
+
+def test_integrate_elevation_map_observations_prunes_far_cells_outside_retention_window():
+    module = load_module()
+    state = module.create_rolling_elevation_map(
+        module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0, retention_multiplier=1.0)
+    )
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.4]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+    module.integrate_elevation_map_observations(
+        state,
+        np.empty((0, 3), dtype=np.float32),
+        robot_position_xy=np.array([10.0, 10.0], dtype=np.float32),
+    )
+
+    assert state.observed_height_by_cell == {}

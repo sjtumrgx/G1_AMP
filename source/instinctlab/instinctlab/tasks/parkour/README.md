@@ -33,6 +33,7 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --video \
     --show_depth_window \
     --show_depth_coverage \
+    --show_elevation_map_window \
     --disable_auto_reset \
     --video_duration_s 300
 ```
@@ -47,15 +48,18 @@ What this command does:
 - `--video`: enables video recording.
 - `--show_depth_window`: opens a live depth preview window.
 - `--show_depth_coverage`: shows the raw camera coverage footprint in the RGB scene.
+- `--show_elevation_map_window`: opens a robot-centered rolling elevation-map window that preserves seen terrain and leaves unseen cells blank.
 - `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
 - `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
 
 Play-visualization config:
 
-- The centralized toggle block lives in `source/instinctlab/instinctlab/tasks/parkour/config/g1/g1_parkour_target_amp_cfg.py` as `ParkourPlayVisualizationCfg`.
-- The seven config booleans are:
+- `source/instinctlab/instinctlab/tasks/parkour/scripts/play_runtime.py` resolves an optional `env_cfg.play_visualization` namespace plus the CLI overrides below.
+- This repo's current G1 parkour config does not define play-visualization defaults, so the CLI flags are the normal entry point unless you add your own `play_visualization` block.
+- The eight visualization booleans are:
   - `depth_window`
   - `depth_coverage`
+  - `elevation_map_window`
   - `normals_panel`
   - `route_overlay`
   - `foot_contact_overlay`
@@ -64,6 +68,7 @@ Play-visualization config:
 - CLI flags can override these defaults at runtime:
   - `--show_depth_window`
   - `--show_depth_coverage`
+  - `--show_elevation_map_window`
   - `--normals_panel`
   - `--route_overlay`
   - `--foot_contact_overlay`
@@ -73,6 +78,7 @@ Play-visualization config:
 Notes:
 
 - The red coverage visualization shows the raw grouped ray-caster field of view. The policy depth observation is still a cropped lower-center patch after preprocessing.
+- The elevation-map window is a world-aligned local memory view centered on the robot: seen cells are retained over time, while unseen cells intentionally remain blank in v1.
 - Keyboard commands during play are:
   - `W`: increase forward command
   - `F`: positive yaw
