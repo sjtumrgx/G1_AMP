@@ -39,6 +39,7 @@ class PlayVisualizationConfig:
     depth_window: bool = False
     depth_coverage: bool = False
     elevation_map_window: bool = False
+    elevation_viewport: bool = False
     normals_panel: bool = False
     route_overlay: bool = False
     foot_contact_overlay: bool = False
@@ -112,6 +113,12 @@ def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Show a robot-centered rolling local elevation-map preview window built from observed ray hits.",
+    )
+    parser.add_argument(
+        "--show_elevation_viewport",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Show a draggable 3D viewport with the robot and a reconstructed elevation surface.",
     )
     parser.add_argument(
         "--normals_panel",
@@ -382,6 +389,10 @@ def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConf
         elevation_map_window=_resolve_visualization_flag(
             default=getattr(defaults, "elevation_map_window", False),
             override=getattr(options, "show_elevation_map_window", None),
+        ),
+        elevation_viewport=_resolve_visualization_flag(
+            default=getattr(defaults, "elevation_viewport", False),
+            override=getattr(options, "show_elevation_viewport", None),
         ),
         normals_panel=_resolve_visualization_flag(
             default=getattr(defaults, "normals_panel", False),
@@ -936,6 +947,7 @@ def _get_play_visualization_config(options) -> PlayVisualizationConfig:
             depth_window=bool(getattr(options, "show_depth_window", False)),
             depth_coverage=bool(getattr(options, "show_depth_coverage", False)),
             elevation_map_window=bool(getattr(options, "show_elevation_map_window", False)),
+            elevation_viewport=bool(getattr(options, "show_elevation_viewport", False)),
             normals_panel=bool(getattr(options, "normals_panel", False)),
             route_overlay=bool(getattr(options, "route_overlay", False)),
             foot_contact_overlay=bool(getattr(options, "foot_contact_overlay", False)),
@@ -948,6 +960,7 @@ def _get_play_visualization_config(options) -> PlayVisualizationConfig:
         depth_window=bool(getattr(visualization, "depth_window", False)),
         depth_coverage=bool(getattr(visualization, "depth_coverage", False)),
         elevation_map_window=bool(getattr(visualization, "elevation_map_window", False)),
+        elevation_viewport=bool(getattr(visualization, "elevation_viewport", False)),
         normals_panel=bool(getattr(visualization, "normals_panel", False)),
         route_overlay=bool(getattr(visualization, "route_overlay", False)),
         foot_contact_overlay=bool(getattr(visualization, "foot_contact_overlay", False)),
@@ -1207,6 +1220,117 @@ def _normalize_elevation_heights_for_display(heights: np.ndarray) -> np.ndarray:
         return np.full(height_values.shape, 160, dtype=np.uint8)
     normalized = (height_values - min_height) / (max_height - min_height)
     return np.clip(np.round(normalized * 255.0), 0.0, 255.0).astype(np.uint8)
+
+
+def compute_preview_relative_body_positions(
+    root_position_w,
+    body_positions_w,
+    *,
+    preview_origin=(0.0, 0.0, 0.9),
+) -> np.ndarray:
+    root_position = np.asarray(root_position_w, dtype=np.float32).reshape(3)
+    body_positions = np.asarray(body_positions_w, dtype=np.float32).reshape(-1, 3)
+    preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
+    return body_positions - root_position[None, :] + preview_origin_array[None, :]
+
+
+def build_elevation_surface_mesh_data(
+    state: RollingElevationMapState,
+    *,
+    robot_position_w,
+    preview_origin=(0.0, 0.0, 0.9),
+    base_height_offset: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(state, RollingElevationMapState):
+        raise TypeError(f"Expected RollingElevationMapState, got {type(state)!r}.")
+    if not state.observed_height_by_cell:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
+
+    robot_position = np.asarray(robot_position_w, dtype=np.float32).reshape(3)
+    preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
+    cell_items = sorted(state.observed_height_by_cell.items())
+    height_lookup_world = {cell_key: float(height) for cell_key, height in cell_items}
+    heights_rel = np.asarray(
+        [height - float(robot_position[2]) + float(preview_origin_array[2]) for height in height_lookup_world.values()],
+        dtype=np.float32,
+    )
+    base_height = float(np.min(heights_rel) - float(base_height_offset))
+
+    vertices: list[list[float]] = []
+    face_vertex_counts: list[int] = []
+    face_vertex_indices: list[int] = []
+    display_colors: list[list[float]] = []
+
+    normalized_heights = _normalize_elevation_heights_for_display(np.asarray(list(height_lookup_world.values()), dtype=np.float32))
+    colors = cv2.applyColorMap(normalized_heights[:, None], cv2.COLORMAP_TURBO)[:, 0, ::-1].astype(np.float32) / 255.0
+    color_lookup = {
+        cell_key: colors[cell_index]
+        for cell_index, (cell_key, _) in enumerate(cell_items)
+    }
+
+    def add_quad(face_vertices: list[list[float]], face_color: np.ndarray) -> None:
+        base_vertex = len(vertices)
+        vertices.extend(face_vertices)
+        color_list = face_color.astype(np.float32, copy=False).tolist()
+        display_colors.extend([color_list] * len(face_vertices))
+        face_vertex_counts.append(len(face_vertices))
+        face_vertex_indices.extend(range(base_vertex, base_vertex + len(face_vertices)))
+
+    for (cell_x, cell_y), cell_height_world in cell_items:
+        x_min, x_max, y_min, y_max = _cell_bounds_from_index((cell_x, cell_y), resolution_m=state.config.resolution_m)
+        x0 = float(x_min - robot_position[0] + preview_origin_array[0])
+        x1 = float(x_max - robot_position[0] + preview_origin_array[0])
+        y0 = float(y_min - robot_position[1] + preview_origin_array[1])
+        y1 = float(y_max - robot_position[1] + preview_origin_array[1])
+        z_top = float(cell_height_world - robot_position[2] + preview_origin_array[2])
+        cell_color = color_lookup[(cell_x, cell_y)]
+
+        add_quad(
+            [
+                [x0, y0, z_top],
+                [x1, y0, z_top],
+                [x1, y1, z_top],
+                [x0, y1, z_top],
+            ],
+            cell_color,
+        )
+
+        side_color = np.clip(cell_color * 0.72, 0.0, 1.0)
+        edge_specs = (
+            ((0, -1), ([x0, y0], [x1, y0])),
+            ((1, 0), ([x1, y0], [x1, y1])),
+            ((0, 1), ([x1, y1], [x0, y1])),
+            ((-1, 0), ([x0, y1], [x0, y0])),
+        )
+        for (offset_x, offset_y), (edge_start_xy, edge_end_xy) in edge_specs:
+            neighbor_height_world = height_lookup_world.get((cell_x + offset_x, cell_y + offset_y))
+            if neighbor_height_world is None:
+                wall_bottom = base_height
+            else:
+                wall_bottom = float(neighbor_height_world - robot_position[2] + preview_origin_array[2])
+            if z_top <= wall_bottom + 1e-5:
+                continue
+            add_quad(
+                [
+                    [float(edge_start_xy[0]), float(edge_start_xy[1]), z_top],
+                    [float(edge_end_xy[0]), float(edge_end_xy[1]), z_top],
+                    [float(edge_end_xy[0]), float(edge_end_xy[1]), wall_bottom],
+                    [float(edge_start_xy[0]), float(edge_start_xy[1]), wall_bottom],
+                ],
+                side_color,
+            )
+
+    return (
+        np.asarray(vertices, dtype=np.float32),
+        np.asarray(face_vertex_counts, dtype=np.int32),
+        np.asarray(face_vertex_indices, dtype=np.int32),
+        np.asarray(display_colors, dtype=np.float32),
+    )
 
 
 def _discover_single_display_active_gpu(*, command_runner) -> int | None:

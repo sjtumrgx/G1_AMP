@@ -348,6 +348,7 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --show_depth_window \
     --show_depth_coverage \
     --show_elevation_map_window \
+    --show_elevation_viewport \
     --disable_auto_reset \
     --video_duration_s 300
 ```
@@ -363,6 +364,7 @@ What this command does:
 - `--show_depth_window`: opens a live depth preview window.
 - `--show_depth_coverage`: shows the raw camera coverage footprint in the RGB scene.
 - `--show_elevation_map_window`: opens a robot-centered rolling elevation-map window that preserves seen terrain and leaves unseen cells blank.
+- `--show_elevation_viewport`: opens a second interactive Isaac Sim viewport that renders the robot plus a displaced 3D elevation surface without the original terrain.
 - `--disable_auto_reset`: prevents termination conditions from immediately resetting the robot during manual debugging.
 - `--video_duration_s 300`: records up to 300 seconds of encoded video instead of the shorter default clip.
 
@@ -378,11 +380,12 @@ Current behavior:
 - The current G1 parkour config does **not** define play-visualization defaults, so the CLI flags below are the normal entry point unless you add your own `play_visualization` block.
 - These flags use `argparse.BooleanOptionalAction`, so each toggle supports both enable and disable forms.
 
-The eight visualization toggles are:
+The nine visualization toggles are:
 
 - `depth_window`
 - `depth_coverage`
 - `elevation_map_window`
+- `elevation_viewport`
 - `normals_panel`
 - `route_overlay`
 - `foot_contact_overlay`
@@ -394,6 +397,7 @@ CLI override forms:
 - `--show_depth_window` / `--no-show_depth_window`
 - `--show_depth_coverage` / `--no-show_depth_coverage`
 - `--show_elevation_map_window` / `--no-show_elevation_map_window`
+- `--show_elevation_viewport` / `--no-show_elevation_viewport`
 - `--normals_panel` / `--no-normals_panel`
 - `--route_overlay` / `--no-route_overlay`
 - `--foot_contact_overlay` / `--no-foot_contact_overlay`
@@ -403,7 +407,7 @@ CLI override forms:
 Examples:
 
 ```bash
-# Enable all eight visualizations for one run
+# Enable all nine visualizations for one run
 OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --task=Instinct-Parkour-Target-Amp-G1-v0 \
     --load_run=20260327_163647 \
@@ -412,17 +416,18 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --show_depth_window \
     --show_depth_coverage \
     --show_elevation_map_window \
+    --show_elevation_viewport \
     --normals_panel \
     --route_overlay \
     --foot_contact_overlay \
     --ghost_reference \
     --obstacle_edges
 
-# Start from defaults, but enable only the new elevation map window explicitly
+# Start from defaults, but enable only the new 3D elevation viewport explicitly
 OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
     --task=Instinct-Parkour-Target-Amp-G1-v0 \
     --load_run=20260327_163647 \
-    --show_elevation_map_window
+    --show_elevation_viewport
 ```
 
 #### 1. `depth_window`
@@ -478,6 +483,26 @@ OMNI_KIT_ACCEPT_EULA=YES python scripts/instinct_rl/play_depth.py \
   - current preview image size is `240 x 240`
   - current map resolution is `0.1 m`
   - current map span is `6.0 m x 6.0 m`
+
+#### 3b. `elevation_viewport`
+
+- Purpose: opens a second interactive Isaac Sim viewport window named `parkour_elevation_viewport`.
+- Enable:
+  - CLI: `--show_elevation_viewport`
+- Disable:
+  - CLI: `--no-show_elevation_viewport`
+- Runtime requirements:
+  - interactive rendering only; this flag is not supported together with `--headless`
+- What it shows:
+  - the robot mirrored into a preview-only scene using the existing body visual prims
+  - a displaced 3D elevation surface generated from the same rolling local elevation-map state as `elevation_map_window`
+  - unknown / never-seen cells remain absent instead of being hallucinated into a full terrain
+- Scene semantics:
+  - the preview scene is anchored far away inside the same USD stage so the secondary viewport can omit the original terrain assets while still using Isaac Sim rendering, materials, and free-camera interaction
+  - the preview robot follows env-0 body transforms every frame, so you can orbit around the reconstructed surface like a normal simulation viewport
+- Recording behavior:
+  - when `--video` is enabled, the viewport writes a companion MP4 next to the main play video using the suffix `-elevation-viewport.mp4`
+  - the viewport recording uses the same FPS / frame-stride settings as the main play capture
 
 #### 4. `normals_panel`
 

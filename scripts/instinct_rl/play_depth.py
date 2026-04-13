@@ -126,6 +126,8 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+from elevation_viewport import ElevationViewportRig, build_elevation_viewport_output_path
+
 import gymnasium as gym
 import imageio.v2 as imageio
 import numpy as np
@@ -150,6 +152,7 @@ from instinctlab.tasks.parkour.scripts.keyboard_commands import (
     ParkourKeyboardCommandController,
     resolve_keyboard_command_limits,
 )
+from instinctlab.assets.unitree_g1 import G1_29DOF_LINKS
 from instinctlab.tasks.parkour.scripts.config_loading import load_logged_config
 from instinctlab.tasks.parkour.scripts.play_route import (
     RouteWaypointFollower,
@@ -189,6 +192,14 @@ def _read_root_state(env) -> tuple[np.ndarray, float]:
     root_position = robot.data.root_pos_w[0].detach().cpu().numpy()
     root_quat = robot.data.root_quat_w[0].detach().cpu().numpy()
     return root_position, _quat_wxyz_to_yaw(root_quat)
+
+
+def _read_preview_body_states(robot, body_ids) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    body_index_list = [int(index) for index in np.asarray(body_ids, dtype=np.int64).reshape(-1).tolist()]
+    root_position = robot.data.root_pos_w[0].detach().cpu().numpy()
+    body_positions = robot.data.body_pos_w[0, body_index_list].detach().cpu().numpy()
+    body_quats = robot.data.body_quat_w[0, body_index_list].detach().cpu().numpy()
+    return root_position, body_positions, body_quats
 
 
 def _pin_first_env_to_center_origin(env) -> bool:
@@ -247,6 +258,20 @@ def _read_camera_ray_hits(env) -> np.ndarray | None:
     if hasattr(ray_hits_env0, "detach"):
         return ray_hits_env0.detach().cpu().numpy()
     return np.asarray(ray_hits_env0, dtype=np.float32)
+
+
+def _update_elevation_map_state(env, elevation_map_state) -> None:
+    if elevation_map_state is None:
+        return
+    ray_hits_w = _read_camera_ray_hits(env)
+    if ray_hits_w is None:
+        return
+    root_position, _ = _read_root_state(env)
+    integrate_elevation_map_observations(
+        elevation_map_state,
+        ray_hits_w,
+        robot_position_xy=root_position[:2],
+    )
 
 
 def _log_depth_input_design(env_cfg) -> None:
@@ -485,6 +510,7 @@ class PlayCaptureRig:
         show_elevation_map_window: bool,
         show_normals_panel: bool,
         video_layout: str,
+        elevation_map_state=None,
         route_map_waypoints_xy: list[list[float]] | list[tuple[float, float]] | None = None,
         route_map_tile_wall_edges=None,
     ):
@@ -511,7 +537,7 @@ class PlayCaptureRig:
         self._disabled_preview_windows: set[str] = set()
         self.route_map_waypoints_xy = [list(point) for point in route_map_waypoints_xy] if route_map_waypoints_xy else None
         self.route_map_tile_wall_edges = route_map_tile_wall_edges
-        self._elevation_map_state = create_rolling_elevation_map() if self.show_elevation_map_window else None
+        self._elevation_map_state = elevation_map_state
         self._camera_specs = build_default_tracking_camera_specs() if output_path is not None else []
         self._cameras: dict[str, Camera] = {}
         self._camera_resolution = resolve_recording_camera_resolution(video_layout)
@@ -696,15 +722,7 @@ class PlayCaptureRig:
     def _build_elevation_map_panel(self) -> np.ndarray | None:
         if self._elevation_map_state is None:
             return None
-        ray_hits_w = _read_camera_ray_hits(self.env)
-        if ray_hits_w is None:
-            return None
         root_position, root_yaw = _read_root_state(self.env)
-        integrate_elevation_map_observations(
-            self._elevation_map_state,
-            ray_hits_w,
-            robot_position_xy=root_position[:2],
-        )
         return render_elevation_map_panel(
             self._elevation_map_state,
             robot_position_xy=root_position[:2],
@@ -716,6 +734,9 @@ def main():
     """Play with Instinct-RL agent."""
     env = None
     capture_rig = None
+    elevation_viewport_rig = None
+    elevation_viewport_body_ids = None
+    shared_elevation_map_state = None
     keyboard_subscription = None
     video_output_path = None
     interrupted = False
@@ -768,6 +789,7 @@ def main():
     args_cli.show_depth_window = args_cli.visualization.depth_window
     args_cli.show_depth_coverage = args_cli.visualization.depth_coverage
     args_cli.show_elevation_map_window = args_cli.visualization.elevation_map_window
+    args_cli.show_elevation_viewport = args_cli.visualization.elevation_viewport
     args_cli.normals_panel = args_cli.visualization.normals_panel
     args_cli.route_overlay = args_cli.visualization.route_overlay
     args_cli.foot_contact_overlay = args_cli.visualization.foot_contact_overlay
@@ -782,6 +804,8 @@ def main():
         agent_cfg.seed = play_seed
         print(f"[INFO] Using play seed: {play_seed}")
     prepare_play_env_cfg(env_cfg, args_cli, seed=play_seed, route_artifact=route_artifact)
+    if args_cli.show_elevation_viewport and args_cli.headless:
+        raise ValueError("--show_elevation_viewport requires interactive rendering; do not combine it with --headless.")
     if args_cli.agent_cfg:
         agent_cfg_dict = load_logged_config(log_dir, "agent")
         if isinstance(agent_cfg_dict, dict) and play_seed is not None:
@@ -803,6 +827,21 @@ def main():
 
         # wrap around environment for instinct-rl
         env = InstinctRlVecEnvWrapper(env)
+
+        if args_cli.show_elevation_viewport:
+            robot = env.unwrapped.scene["robot"]
+            elevation_viewport_body_ids, elevation_viewport_body_names = robot.find_bodies(
+                G1_29DOF_LINKS,
+                preserve_order=True,
+            )
+            source_robot_prim = sim_utils.find_first_matching_prim(robot.cfg.prim_path)
+            if source_robot_prim is None or not source_robot_prim.IsValid():
+                raise RuntimeError(f"Failed to resolve source robot prim from expression: {robot.cfg.prim_path}")
+            elevation_viewport_rig = ElevationViewportRig(
+                body_names=elevation_viewport_body_names,
+                source_robot_prim_path=source_robot_prim.GetPath().pathString,
+                elevation_map_state=None,
+            )
 
         # load previously trained model
         ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
@@ -918,6 +957,10 @@ def main():
         else:
             obs, _ = env.get_observations()
 
+        if args_cli.show_elevation_map_window or args_cli.show_elevation_viewport:
+            shared_elevation_map_state = create_rolling_elevation_map()
+            _update_elevation_map_state(env, shared_elevation_map_state)
+
         if args_cli.save_route is not None:
             terrain_generator_cfg = getattr(getattr(env_cfg.scene, "terrain", None), "terrain_generator", None)
             saved_tile_wall_edges = None
@@ -970,10 +1013,30 @@ def main():
             show_elevation_map_window=args_cli.show_elevation_map_window,
             show_normals_panel=args_cli.normals_panel,
             video_layout=args_cli.video_layout,
+            elevation_map_state=shared_elevation_map_state,
             route_map_waypoints_xy=None if route_artifact is None else route_artifact.waypoints_xy,
             route_map_tile_wall_edges=None if route_artifact is None else route_artifact.tile_wall_edges,
         )
         capture_rig.capture(0)
+        if args_cli.show_elevation_viewport:
+            elevation_viewport_output_path = build_elevation_viewport_output_path(video_output_path) if args_cli.video else None
+            elevation_viewport_rig.elevation_map_state = shared_elevation_map_state
+            elevation_viewport_rig.configure_capture(
+                elevation_viewport_output_path,
+                video_fps=capture_settings.video_fps,
+                video_frame_stride=capture_settings.frame_stride,
+            )
+            robot = env.unwrapped.scene["robot"]
+            preview_root_position, preview_body_positions, preview_body_quats = _read_preview_body_states(
+                robot,
+                elevation_viewport_body_ids,
+            )
+            elevation_viewport_rig.update(
+                0,
+                robot_root_position_w=preview_root_position,
+                robot_body_positions_w=preview_body_positions,
+                robot_body_quats_w=preview_body_quats,
+            )
         if route_overlay is not None:
             root_position, root_yaw = _read_root_state(env)
             current_command = (
@@ -1011,6 +1074,7 @@ def main():
                 # env stepping
                 obs, rewards, dones, infos = env.step(actions)
             timestep += 1
+            _update_elevation_map_state(env, shared_elevation_map_state)
             if route_recorder is not None:
                 root_position, _ = _read_root_state(env)
                 route_recorder.record_position(root_position)
@@ -1024,6 +1088,18 @@ def main():
                 route_overlay.update(position_xy=root_position[:2], yaw=root_yaw, command=current_command)
             if foot_contact_overlay is not None:
                 foot_contact_overlay.update(timestep=timestep)
+            if elevation_viewport_rig is not None:
+                robot = env.unwrapped.scene["robot"]
+                preview_root_position, preview_body_positions, preview_body_quats = _read_preview_body_states(
+                    robot,
+                    elevation_viewport_body_ids,
+                )
+                elevation_viewport_rig.update(
+                    timestep,
+                    robot_root_position_w=preview_root_position,
+                    robot_body_positions_w=preview_body_positions,
+                    robot_body_quats_w=preview_body_quats,
+                )
             capture_rig.capture(timestep)
 
             if capture_rig.is_complete or (route_follower is not None and route_follower.is_complete):
@@ -1040,6 +1116,8 @@ def main():
                 route_recorder.record_position(root_position)
             route_path = save_route_artifact(args_cli.save_route, route_recorder.build_artifact())
             print(f"[INFO] Saved route artifact to {route_path}")
+        if elevation_viewport_rig is not None:
+            elevation_viewport_rig.close()
         if route_overlay is not None:
             route_overlay.close()
         if foot_contact_overlay is not None:

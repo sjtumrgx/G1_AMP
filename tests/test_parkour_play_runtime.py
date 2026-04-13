@@ -92,6 +92,7 @@ def test_add_play_runtime_args_accepts_new_flags():
             "--show_depth_window",
             "--show_depth_coverage",
             "--show_elevation_map_window",
+            "--show_elevation_viewport",
             "--normals_panel",
             "--route_overlay",
             "--foot_contact_overlay",
@@ -126,6 +127,7 @@ def test_add_play_runtime_args_accepts_new_flags():
     assert args.show_depth_window is True
     assert args.show_depth_coverage is True
     assert args.show_elevation_map_window is True
+    assert args.show_elevation_viewport is True
     assert args.normals_panel is True
     assert args.route_overlay is True
     assert args.foot_contact_overlay is True
@@ -198,6 +200,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
         depth_window=True,
         depth_coverage=True,
         elevation_map_window=True,
+        elevation_viewport=True,
         normals_panel=True,
         route_overlay=True,
         foot_contact_overlay=True,
@@ -208,6 +211,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
         show_depth_window=None,
         show_depth_coverage=None,
         show_elevation_map_window=None,
+        show_elevation_viewport=None,
         normals_panel=None,
         route_overlay=None,
         foot_contact_overlay=None,
@@ -220,6 +224,7 @@ def test_resolve_play_visualization_config_uses_env_defaults():
     assert resolved.depth_window is True
     assert resolved.depth_coverage is True
     assert resolved.elevation_map_window is True
+    assert resolved.elevation_viewport is True
     assert resolved.normals_panel is True
     assert resolved.route_overlay is True
     assert resolved.foot_contact_overlay is True
@@ -234,6 +239,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
         depth_window=True,
         depth_coverage=True,
         elevation_map_window=False,
+        elevation_viewport=False,
         normals_panel=False,
         route_overlay=False,
         foot_contact_overlay=True,
@@ -244,6 +250,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
         show_depth_window=False,
         show_depth_coverage=None,
         show_elevation_map_window=True,
+        show_elevation_viewport=True,
         normals_panel=True,
         route_overlay=True,
         foot_contact_overlay=False,
@@ -256,6 +263,7 @@ def test_resolve_play_visualization_config_applies_cli_overrides():
     assert resolved.depth_window is False
     assert resolved.depth_coverage is True
     assert resolved.elevation_map_window is True
+    assert resolved.elevation_viewport is True
     assert resolved.normals_panel is True
     assert resolved.route_overlay is True
     assert resolved.foot_contact_overlay is False
@@ -276,6 +284,7 @@ def test_apply_play_runtime_overrides_reads_visualization_namespace():
             depth_window=True,
             depth_coverage=True,
             elevation_map_window=False,
+            elevation_viewport=False,
             normals_panel=False,
             route_overlay=False,
             foot_contact_overlay=False,
@@ -1207,3 +1216,91 @@ def test_integrate_elevation_map_observations_prunes_far_cells_outside_retention
     )
 
     assert state.observed_height_by_cell == {}
+
+
+def test_get_play_visualization_config_reads_namespace_elevation_viewport():
+    module = load_module()
+    config = module._get_play_visualization_config(
+        SimpleNamespace(
+            visualization=SimpleNamespace(
+                depth_window=False,
+                depth_coverage=False,
+                elevation_map_window=False,
+                elevation_viewport=True,
+                normals_panel=False,
+                route_overlay=False,
+                foot_contact_overlay=False,
+                ghost_reference=False,
+                obstacle_edges=False,
+            )
+        )
+    )
+
+    assert config.elevation_viewport is True
+
+
+def test_build_elevation_surface_mesh_data_returns_displaced_geometry():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2], [1.1, 0.1, 0.8]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    points, face_counts, face_indices, display_colors = module.build_elevation_surface_mesh_data(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.5], dtype=np.float32),
+    )
+
+    assert points.shape[1] == 3
+    assert face_counts.size > 0
+    assert face_indices.size > 0
+    assert display_colors.shape[0] == points.shape[0]
+    assert np.unique(points[:, 2]).size > 2
+
+
+def test_build_elevation_surface_mesh_data_omits_unknown_cells():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+
+    points, face_counts, face_indices, display_colors = module.build_elevation_surface_mesh_data(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert points.size == 0
+    assert face_counts.size == 0
+    assert face_indices.size == 0
+    assert display_colors.size == 0
+
+
+def test_build_elevation_surface_mesh_data_bridges_neighbor_height_steps():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2], [1.1, 0.1, 0.8]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    points, _, _, _ = module.build_elevation_surface_mesh_data(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.5], dtype=np.float32),
+    )
+
+    z_values = np.unique(np.round(points[:, 2], decimals=3))
+    assert np.any(np.isclose(z_values, 0.6, atol=1e-3))
+    assert np.any(np.isclose(z_values, 1.2, atol=1e-3))
+
+
+def test_compute_preview_relative_body_positions_centers_on_root():
+    module = load_module()
+    relative = module.compute_preview_relative_body_positions(
+        np.array([1.0, 2.0, 3.0], dtype=np.float32),
+        np.array([[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]], dtype=np.float32),
+        preview_origin=(0.0, 0.0, 0.9),
+    )
+
+    np.testing.assert_allclose(relative[0], np.array([0.0, 0.0, 0.9], dtype=np.float32))
+    np.testing.assert_allclose(relative[1], np.array([1.0, 2.0, 3.9], dtype=np.float32))
