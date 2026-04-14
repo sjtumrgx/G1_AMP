@@ -15,6 +15,7 @@ from play_runtime import (
     ELEVATION_MAP_WINDOW_NAME,
     NORMALS_WINDOW_NAME,
     add_play_runtime_args,
+    build_elevation_surface_mesh_payload,
     build_play_video_output_path,
     build_default_tracking_camera_specs,
     build_live_preview_panels,
@@ -24,6 +25,7 @@ from play_runtime import (
     create_keyboard_event_subscription,
     create_rolling_elevation_map,
     ensure_sensor_initialized,
+    filter_elevation_observation_points,
     integrate_elevation_map_observations,
     normalize_depth_frame_for_display,
     normalize_normals_frame_for_display,
@@ -126,7 +128,14 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
-from elevation_viewport import ElevationViewportRig, build_elevation_viewport_output_path
+from mujoco_elevation_viewer import (
+    MuJoCoElevationViewerConfig,
+    MuJoCoElevationViewerRig,
+    build_mujoco_elevation_capture_path,
+    build_mujoco_elevation_frame_dir,
+    build_mujoco_elevation_log_path,
+    build_mujoco_elevation_screenshot_path,
+)
 
 import gymnasium as gym
 import imageio.v2 as imageio
@@ -152,7 +161,6 @@ from instinctlab.tasks.parkour.scripts.keyboard_commands import (
     ParkourKeyboardCommandController,
     resolve_keyboard_command_limits,
 )
-from instinctlab.assets.unitree_g1 import G1_29DOF_LINKS
 from instinctlab.tasks.parkour.scripts.config_loading import load_logged_config
 from instinctlab.tasks.parkour.scripts.play_route import (
     RouteWaypointFollower,
@@ -194,12 +202,49 @@ def _read_root_state(env) -> tuple[np.ndarray, float]:
     return root_position, _quat_wxyz_to_yaw(root_quat)
 
 
-def _read_preview_body_states(robot, body_ids) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    body_index_list = [int(index) for index in np.asarray(body_ids, dtype=np.int64).reshape(-1).tolist()]
+def _resolve_robot_joint_names(robot) -> list[str]:
+    for attr_name in ("joint_names", "dof_names"):
+        value = getattr(robot, attr_name, None)
+        if value:
+            return [str(name) for name in value]
+        value = getattr(getattr(robot, "data", None), attr_name, None)
+        if value:
+            return [str(name) for name in value]
+    physx_view = getattr(robot, "root_physx_view", None)
+    shared_metatype = getattr(physx_view, "shared_metatype", None)
+    dof_names = getattr(shared_metatype, "dof_names", None)
+    if dof_names:
+        return [str(name) for name in dof_names]
+    raise RuntimeError("Failed to resolve robot joint names for MuJoCo elevation viewer sync.")
+
+
+def _read_mujoco_sync_state(robot) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
     root_position = robot.data.root_pos_w[0].detach().cpu().numpy()
-    body_positions = robot.data.body_pos_w[0, body_index_list].detach().cpu().numpy()
-    body_quats = robot.data.body_quat_w[0, body_index_list].detach().cpu().numpy()
-    return root_position, body_positions, body_quats
+    root_quat = robot.data.root_quat_w[0].detach().cpu().numpy()
+    joint_positions = robot.data.joint_pos[0].detach().cpu().numpy()
+    joint_names = _resolve_robot_joint_names(robot)
+    if len(joint_names) != int(joint_positions.shape[0]):
+        joint_names = joint_names[: int(joint_positions.shape[0])]
+    joint_positions_by_name = {
+        str(joint_name): float(joint_value)
+        for joint_name, joint_value in zip(joint_names, joint_positions, strict=False)
+    }
+    return root_position, root_quat, joint_positions_by_name
+
+
+def _read_robot_body_positions(robot) -> np.ndarray:
+    return robot.data.body_pos_w[0].detach().cpu().numpy()
+
+
+def _read_camera_position_w(env) -> np.ndarray | None:
+    camera_sensor = env.unwrapped.scene.sensors["camera"]
+    camera_pos_w = getattr(getattr(camera_sensor, "data", None), "pos_w", None)
+    if camera_pos_w is None:
+        return None
+    camera_pos_env0 = camera_pos_w[0]
+    if hasattr(camera_pos_env0, "detach"):
+        return camera_pos_env0.detach().cpu().numpy()
+    return np.asarray(camera_pos_env0, dtype=np.float32)
 
 
 def _pin_first_env_to_center_origin(env) -> bool:
@@ -224,7 +269,10 @@ def _resolve_depth_display_range(env_cfg, using_noised_output: bool) -> tuple[fl
     depth_normalization = noise_pipeline.get("depth_normalization")
     if depth_normalization is None:
         return (0.0, 2.5)
-    return tuple(getattr(depth_normalization, "depth_range", (0.0, 2.5)))
+    depth_range = tuple(float(value) for value in getattr(depth_normalization, "depth_range", (0.0, 2.5)))
+    if len(depth_range) != 2:
+        return (0.0, 2.5)
+    return (depth_range[0], depth_range[1])
 
 
 def _read_depth_panel(env, env_cfg) -> np.ndarray:
@@ -266,11 +314,20 @@ def _update_elevation_map_state(env, elevation_map_state) -> None:
     ray_hits_w = _read_camera_ray_hits(env)
     if ray_hits_w is None:
         return
+    robot = env.unwrapped.scene["robot"]
+    filtered_ray_hits_w = filter_elevation_observation_points(
+        ray_hits_w,
+        robot_body_positions_w=_read_robot_body_positions(robot),
+    )
+    if filtered_ray_hits_w.size == 0:
+        return
     root_position, _ = _read_root_state(env)
+    camera_position_w = _read_camera_position_w(env)
     integrate_elevation_map_observations(
         elevation_map_state,
-        ray_hits_w,
+        filtered_ray_hits_w,
         robot_position_xy=root_position[:2],
+        sensor_origin_w=camera_position_w if camera_position_w is not None else root_position,
     )
 
 
@@ -734,8 +791,7 @@ def main():
     """Play with Instinct-RL agent."""
     env = None
     capture_rig = None
-    elevation_viewport_rig = None
-    elevation_viewport_body_ids = None
+    mujoco_elevation_viewer = None
     shared_elevation_map_state = None
     keyboard_subscription = None
     video_output_path = None
@@ -828,20 +884,8 @@ def main():
         # wrap around environment for instinct-rl
         env = InstinctRlVecEnvWrapper(env)
 
-        if args_cli.show_elevation_viewport:
-            robot = env.unwrapped.scene["robot"]
-            elevation_viewport_body_ids, elevation_viewport_body_names = robot.find_bodies(
-                G1_29DOF_LINKS,
-                preserve_order=True,
-            )
-            source_robot_prim = sim_utils.find_first_matching_prim(robot.cfg.prim_path)
-            if source_robot_prim is None or not source_robot_prim.IsValid():
-                raise RuntimeError(f"Failed to resolve source robot prim from expression: {robot.cfg.prim_path}")
-            elevation_viewport_rig = ElevationViewportRig(
-                body_names=elevation_viewport_body_names,
-                source_robot_prim_path=source_robot_prim.GetPath().pathString,
-                elevation_map_state=None,
-            )
+        if args_cli.show_elevation_map_window or args_cli.show_elevation_viewport:
+            shared_elevation_map_state = create_rolling_elevation_map()
 
         # load previously trained model
         ppo_runner = OnPolicyRunner(env, agent_cfg_dict, log_dir=None, device=agent_cfg.device)
@@ -957,8 +1001,7 @@ def main():
         else:
             obs, _ = env.get_observations()
 
-        if args_cli.show_elevation_map_window or args_cli.show_elevation_viewport:
-            shared_elevation_map_state = create_rolling_elevation_map()
+        if shared_elevation_map_state is not None:
             _update_elevation_map_state(env, shared_elevation_map_state)
 
         if args_cli.save_route is not None:
@@ -1001,6 +1044,39 @@ def main():
             video_fps=args_cli.video_fps,
             replay_route_active=route_artifact is not None,
         )
+        if args_cli.show_elevation_viewport:
+            assert shared_elevation_map_state is not None
+            artifact_seed_path = args_cli.mujoco_elevation_capture_path or video_output_path
+            elevation_map_config = shared_elevation_map_state.config
+            mujoco_capture_path = (
+                args_cli.mujoco_elevation_capture_path
+                if args_cli.mujoco_elevation_capture_path is not None
+                else build_mujoco_elevation_capture_path(video_output_path)
+            )
+            mujoco_frame_dir = (
+                args_cli.mujoco_elevation_frame_dir
+                if args_cli.mujoco_elevation_frame_dir is not None
+                else build_mujoco_elevation_frame_dir(artifact_seed_path)
+            )
+            mujoco_screenshot_path = (
+                args_cli.mujoco_elevation_screenshot_path
+                if args_cli.mujoco_elevation_screenshot_path is not None
+                else build_mujoco_elevation_screenshot_path(artifact_seed_path)
+            )
+            mujoco_log_path = build_mujoco_elevation_log_path(artifact_seed_path)
+            mujoco_elevation_viewer = MuJoCoElevationViewerRig(
+                config=MuJoCoElevationViewerConfig(
+                    surface_rows=max(1, int(round(float(elevation_map_config.size_m) / float(elevation_map_config.resolution_m)))),
+                    surface_cols=max(1, int(round(float(elevation_map_config.size_m) / float(elevation_map_config.resolution_m)))),
+                    surface_resolution_m=float(elevation_map_config.resolution_m),
+                    capture_path=mujoco_capture_path,
+                    frame_dir=mujoco_frame_dir,
+                    screenshot_path=mujoco_screenshot_path,
+                    log_path=mujoco_log_path,
+                    video_fps=capture_settings.video_fps,
+                    video_frame_stride=capture_settings.frame_stride,
+                )
+            )
         capture_rig = PlayCaptureRig(
             env=env,
             env_cfg=env_cfg,
@@ -1018,24 +1094,21 @@ def main():
             route_map_tile_wall_edges=None if route_artifact is None else route_artifact.tile_wall_edges,
         )
         capture_rig.capture(0)
-        if args_cli.show_elevation_viewport:
-            elevation_viewport_output_path = build_elevation_viewport_output_path(video_output_path) if args_cli.video else None
-            elevation_viewport_rig.elevation_map_state = shared_elevation_map_state
-            elevation_viewport_rig.configure_capture(
-                elevation_viewport_output_path,
-                video_fps=capture_settings.video_fps,
-                video_frame_stride=capture_settings.frame_stride,
-            )
+        if mujoco_elevation_viewer is not None:
             robot = env.unwrapped.scene["robot"]
-            preview_root_position, preview_body_positions, preview_body_quats = _read_preview_body_states(
-                robot,
-                elevation_viewport_body_ids,
+            preview_root_position, preview_root_quat, preview_joint_positions = _read_mujoco_sync_state(robot)
+            preview_vertices, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
+                shared_elevation_map_state,
+                robot_position_w=preview_root_position,
             )
-            elevation_viewport_rig.update(
-                0,
-                robot_root_position_w=preview_root_position,
-                robot_body_positions_w=preview_body_positions,
-                robot_body_quats_w=preview_body_quats,
+            mujoco_elevation_viewer.update(
+                timestep=0,
+                root_position_w=preview_root_position,
+                root_quat_w=preview_root_quat,
+                joint_positions_by_name=preview_joint_positions,
+                surface_vertices=preview_vertices,
+                surface_confidence=preview_confidence,
+                surface_valid=preview_valid,
             )
         if route_overlay is not None:
             root_position, root_yaw = _read_root_state(env)
@@ -1056,8 +1129,10 @@ def main():
                 if route_follower is not None:
                     root_position, root_yaw = _read_root_state(env)
                     replay_command = route_follower.compute_command(position_xy=root_position[:2], yaw=root_yaw)
+                    assert keyboard_controller is not None
                     keyboard_controller.set_command(replay_command)
                 if args_cli.keyboard_control or route_follower is not None:
+                    assert keyboard_controller is not None
                     obs[:, command_obs_slice[0]] = keyboard_controller.build_observation()
                 actions = policy(obs)
                 if args_cli.useonnx:
@@ -1088,17 +1163,21 @@ def main():
                 route_overlay.update(position_xy=root_position[:2], yaw=root_yaw, command=current_command)
             if foot_contact_overlay is not None:
                 foot_contact_overlay.update(timestep=timestep)
-            if elevation_viewport_rig is not None:
+            if mujoco_elevation_viewer is not None:
                 robot = env.unwrapped.scene["robot"]
-                preview_root_position, preview_body_positions, preview_body_quats = _read_preview_body_states(
-                    robot,
-                    elevation_viewport_body_ids,
+                preview_root_position, preview_root_quat, preview_joint_positions = _read_mujoco_sync_state(robot)
+                preview_vertices, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
+                    shared_elevation_map_state,
+                    robot_position_w=preview_root_position,
                 )
-                elevation_viewport_rig.update(
-                    timestep,
-                    robot_root_position_w=preview_root_position,
-                    robot_body_positions_w=preview_body_positions,
-                    robot_body_quats_w=preview_body_quats,
+                mujoco_elevation_viewer.update(
+                    timestep=timestep,
+                    root_position_w=preview_root_position,
+                    root_quat_w=preview_root_quat,
+                    joint_positions_by_name=preview_joint_positions,
+                    surface_vertices=preview_vertices,
+                    surface_confidence=preview_confidence,
+                    surface_valid=preview_valid,
                 )
             capture_rig.capture(timestep)
 
@@ -1116,8 +1195,8 @@ def main():
                 route_recorder.record_position(root_position)
             route_path = save_route_artifact(args_cli.save_route, route_recorder.build_artifact())
             print(f"[INFO] Saved route artifact to {route_path}")
-        if elevation_viewport_rig is not None:
-            elevation_viewport_rig.close()
+        if mujoco_elevation_viewer is not None:
+            mujoco_elevation_viewer.close()
         if route_overlay is not None:
             route_overlay.close()
         if foot_contact_overlay is not None:

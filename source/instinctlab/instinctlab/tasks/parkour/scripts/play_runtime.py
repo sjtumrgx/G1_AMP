@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import subprocess
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import cv2
 import numpy as np
@@ -53,6 +53,10 @@ class RollingElevationMapConfig:
     size_m: float = 6.0
     retention_multiplier: float = 2.0
     image_size: tuple[int, int] = (240, 240)
+    min_variance: float = 1.0e-4
+    max_variance: float = 5.0e-2
+    distance_variance_scale: float = 8.0e-3
+    motion_variance_scale: float = 1.5e-2
     unknown_color: tuple[int, int, int] = (0, 0, 0)
     robot_color: tuple[int, int, int] = (14, 165, 233)
     border_color: tuple[int, int, int] = (214, 223, 233)
@@ -64,6 +68,9 @@ class RollingElevationMapState:
     step_count: int = 0
     observed_height_by_cell: dict[tuple[int, int], float] = field(default_factory=dict)
     last_seen_step_by_cell: dict[tuple[int, int], int] = field(default_factory=dict)
+    observation_count_by_cell: dict[tuple[int, int], int] = field(default_factory=dict)
+    variance_by_cell: dict[tuple[int, int], float] = field(default_factory=dict)
+    last_robot_position_xy: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -76,10 +83,10 @@ class ContactOverlayState:
 
 @dataclass
 class KeyboardEventSubscription:
-    input_interface: object
-    keyboard: object
-    handle: object
-    callback: object
+    input_interface: Any
+    keyboard: Any
+    handle: Any
+    callback: Any
 
     def close(self) -> None:
         if self.handle is None:
@@ -116,9 +123,29 @@ def add_play_runtime_args(parser: argparse.ArgumentParser) -> argparse.ArgumentP
     )
     parser.add_argument(
         "--show_elevation_viewport",
+        "--show_mujoco_elevation_viewer",
         action=argparse.BooleanOptionalAction,
+        dest="show_elevation_viewport",
         default=None,
-        help="Show a draggable 3D viewport with the robot and a reconstructed elevation surface.",
+        help="Show a MuJoCo-backed draggable 3D second window with the robot and a reconstructed elevation surface.",
+    )
+    parser.add_argument(
+        "--mujoco_elevation_capture_path",
+        type=str,
+        default=None,
+        help="Optional independent MP4 output path for the MuJoCo elevation viewer.",
+    )
+    parser.add_argument(
+        "--mujoco_elevation_frame_dir",
+        type=str,
+        default=None,
+        help="Optional directory for PNG frame export from the MuJoCo elevation viewer.",
+    )
+    parser.add_argument(
+        "--mujoco_elevation_screenshot_path",
+        type=str,
+        default=None,
+        help="Optional PNG screenshot output path for the MuJoCo elevation viewer.",
     )
     parser.add_argument(
         "--normals_panel",
@@ -509,18 +536,81 @@ def integrate_elevation_map_observations(
     ray_hits_w,
     *,
     robot_position_xy,
+    sensor_origin_w=None,
 ) -> None:
     if not isinstance(state, RollingElevationMapState):
         raise TypeError(f"Expected RollingElevationMapState, got {type(state)!r}.")
     config = state.config
     state.step_count += 1
 
-    observed_cells = _collapse_ray_hits_to_height_cells(ray_hits_w, resolution_m=config.resolution_m)
-    for cell_key, cell_height in observed_cells.items():
-        state.observed_height_by_cell[cell_key] = float(cell_height)
-        state.last_seen_step_by_cell[cell_key] = state.step_count
+    robot_xy = np.asarray(robot_position_xy, dtype=np.float32).reshape(2)
+    previous_robot_xy = None if state.last_robot_position_xy is None else np.asarray(state.last_robot_position_xy, dtype=np.float32).reshape(2)
+    if previous_robot_xy is not None:
+        motion_distance = float(np.linalg.norm(robot_xy - previous_robot_xy))
+        if motion_distance > 1.0e-6:
+            variance_increase = float(np.clip(config.motion_variance_scale * motion_distance * motion_distance, 0.0, config.max_variance))
+            for cell_key, variance in list(state.variance_by_cell.items()):
+                state.variance_by_cell[cell_key] = float(min(config.max_variance, variance + variance_increase))
+    state.last_robot_position_xy = robot_xy.copy()
 
-    _prune_rolling_elevation_map(state, robot_position_xy=robot_position_xy)
+    cell_observations = _collapse_ray_hits_to_cell_observations(
+        ray_hits_w,
+        resolution_m=config.resolution_m,
+        sensor_origin_w=sensor_origin_w,
+        min_variance=config.min_variance,
+        max_variance=config.max_variance,
+        distance_variance_scale=config.distance_variance_scale,
+    )
+    for cell_key, (cell_height, measurement_variance) in cell_observations.items():
+        previous_height = state.observed_height_by_cell.get(cell_key)
+        previous_variance = state.variance_by_cell.get(cell_key)
+        if previous_height is None or previous_variance is None or not np.isfinite(previous_variance):
+            fused_height = float(cell_height)
+            fused_variance = float(measurement_variance)
+        else:
+            fused_height = float(
+                (previous_variance * float(cell_height) + float(measurement_variance) * previous_height)
+                / (previous_variance + float(measurement_variance))
+            )
+            fused_variance = float(
+                max(
+                    config.min_variance,
+                    (float(measurement_variance) * previous_variance) / (float(measurement_variance) + previous_variance),
+                )
+            )
+        state.observed_height_by_cell[cell_key] = fused_height
+        state.variance_by_cell[cell_key] = float(np.clip(fused_variance, config.min_variance, config.max_variance))
+        state.last_seen_step_by_cell[cell_key] = state.step_count
+        state.observation_count_by_cell[cell_key] = state.observation_count_by_cell.get(cell_key, 0) + 1
+
+    _prune_rolling_elevation_map(state, robot_position_xy=robot_xy)
+
+
+def filter_elevation_observation_points(
+    ray_hits_w,
+    *,
+    robot_body_positions_w=None,
+    bottom_crop_fraction: float = 0.3,
+    self_hit_distance_m: float = 0.16,
+) -> np.ndarray:
+    points = np.asarray(ray_hits_w, dtype=np.float32)
+    if points.ndim >= 3 and points.shape[-1] == 3 and bottom_crop_fraction > 0.0:
+        keep_rows = max(1, int(round(points.shape[0] * (1.0 - float(np.clip(bottom_crop_fraction, 0.0, 0.95))))))
+        points = points[:keep_rows, ...]
+    filtered_points = points.reshape(-1, 3)
+    if filtered_points.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    filtered_points = filtered_points[np.isfinite(filtered_points).all(axis=1)]
+    if filtered_points.size == 0 or robot_body_positions_w is None:
+        return filtered_points
+    body_positions = np.asarray(robot_body_positions_w, dtype=np.float32).reshape(-1, 3)
+    if body_positions.size == 0:
+        return filtered_points
+    min_squared_distance = np.min(
+        np.sum((filtered_points[:, None, :] - body_positions[None, :, :]) ** 2, axis=-1),
+        axis=1,
+    )
+    return filtered_points[min_squared_distance >= float(self_hit_distance_m) ** 2]
 
 
 def render_elevation_map_panel(
@@ -546,17 +636,16 @@ def render_elevation_map_panel(
         float(robot_xy[1] + half_extent),
     )
 
-    visible_cells: list[tuple[tuple[int, int], float]] = []
-    for cell_key, cell_height in state.observed_height_by_cell.items():
-        cell_bounds = _cell_bounds_from_index(cell_key, resolution_m=config.resolution_m)
-        if _cell_intersects_bounds(cell_bounds, bounds):
-            visible_cells.append((cell_key, float(cell_height)))
+    visible_cells = _collect_visible_elevation_cells(state, bounds=bounds)
 
     if visible_cells:
-        heights = np.asarray([height for _, height in visible_cells], dtype=np.float32)
-        normalized_heights = _normalize_elevation_heights_for_display(heights)
-        colors = cv2.applyColorMap(normalized_heights[:, None], cv2.COLORMAP_TURBO)[:, 0, :]
-        for (cell_key, _), color in zip(visible_cells, colors, strict=True):
+        colors_rgba = _build_visible_elevation_cell_rgba(
+            state,
+            visible_cells=visible_cells,
+            robot_position_xy=robot_xy,
+        )
+        colors_bgr = np.clip(np.round(colors_rgba[:, :3][:, ::-1] * 255.0), 0.0, 255.0).astype(np.uint8)
+        for (cell_key, _), color in zip(visible_cells, colors_bgr, strict=True):
             x_min, x_max, y_min, y_max = _cell_bounds_from_index(cell_key, resolution_m=config.resolution_m)
             top_left = _world_xy_to_panel_pixel(
                 (x_min, y_max),
@@ -1166,6 +1255,61 @@ def _collapse_ray_hits_to_height_cells(
     return cell_heights
 
 
+def _collapse_ray_hits_to_cell_observations(
+    ray_hits_w,
+    *,
+    resolution_m: float,
+    sensor_origin_w,
+    min_variance: float,
+    max_variance: float,
+    distance_variance_scale: float,
+) -> dict[tuple[int, int], tuple[float, float]]:
+    points = np.asarray(ray_hits_w, dtype=np.float32).reshape(-1, 3)
+    if points.size == 0:
+        return {}
+    valid_points = points[np.isfinite(points).all(axis=1)]
+    if valid_points.size == 0:
+        return {}
+
+    sensor_origin = None if sensor_origin_w is None else np.asarray(sensor_origin_w, dtype=np.float32).reshape(3)
+    cell_observations: dict[tuple[int, int], tuple[float, float]] = {}
+    inverse_resolution = 1.0 / float(resolution_m)
+    for point_x, point_y, point_z in valid_points:
+        cell_key = (
+            int(np.floor(float(point_x) * inverse_resolution)),
+            int(np.floor(float(point_y) * inverse_resolution)),
+        )
+        if sensor_origin is None:
+            measurement_distance = float(np.sqrt(point_x * point_x + point_y * point_y + point_z * point_z))
+        else:
+            measurement_distance = float(np.linalg.norm(np.asarray([point_x, point_y, point_z], dtype=np.float32) - sensor_origin))
+        measurement_variance = float(
+            np.clip(
+                min_variance + distance_variance_scale * measurement_distance * measurement_distance,
+                min_variance,
+                max_variance,
+            )
+        )
+        previous = cell_observations.get(cell_key)
+        if previous is None or float(point_z) > previous[0]:
+            cell_observations[cell_key] = (float(point_z), measurement_variance)
+    return cell_observations
+
+
+def _collect_visible_elevation_cells(
+    state: RollingElevationMapState,
+    *,
+    bounds: tuple[float, float, float, float],
+) -> list[tuple[tuple[int, int], float]]:
+    visible_cells: list[tuple[tuple[int, int], float]] = []
+    for cell_key, cell_height in state.observed_height_by_cell.items():
+        cell_bounds = _cell_bounds_from_index(cell_key, resolution_m=state.config.resolution_m)
+        if _cell_intersects_bounds(cell_bounds, bounds):
+            visible_cells.append((cell_key, float(cell_height)))
+    visible_cells.sort(key=lambda item: item[0])
+    return visible_cells
+
+
 def _prune_rolling_elevation_map(
     state: RollingElevationMapState,
     *,
@@ -1188,6 +1332,7 @@ def _prune_rolling_elevation_map(
     for cell_key in keys_to_delete:
         state.observed_height_by_cell.pop(cell_key, None)
         state.last_seen_step_by_cell.pop(cell_key, None)
+        state.observation_count_by_cell.pop(cell_key, None)
 
 
 def _cell_bounds_from_index(
@@ -1222,6 +1367,214 @@ def _normalize_elevation_heights_for_display(heights: np.ndarray) -> np.ndarray:
     return np.clip(np.round(normalized * 255.0), 0.0, 255.0).astype(np.uint8)
 
 
+def _build_visible_elevation_cell_rgba(
+    state: RollingElevationMapState,
+    *,
+    visible_cells: Sequence[tuple[tuple[int, int], float]],
+    robot_position_xy,
+) -> np.ndarray:
+    if not visible_cells:
+        return np.zeros((0, 4), dtype=np.float32)
+
+    heights = np.asarray([height for _, height in visible_cells], dtype=np.float32)
+    normalized_heights = _normalize_elevation_heights_for_display(heights)
+    height_colors_rgb = cv2.applyColorMap(normalized_heights[:, None], cv2.COLORMAP_TURBO)[:, 0, ::-1].astype(np.float32) / 255.0
+    variances = np.asarray(
+        [state.variance_by_cell.get(cell_key, state.config.max_variance) for cell_key, _ in visible_cells],
+        dtype=np.float32,
+    )
+    confidence = 1.0 - np.clip(
+        (variances - float(state.config.min_variance))
+        / max(float(state.config.max_variance - state.config.min_variance), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    confidence_colors_rgb = cv2.applyColorMap(
+        np.clip(np.round(confidence * 255.0), 0.0, 255.0).astype(np.uint8)[:, None],
+        cv2.COLORMAP_VIRIDIS,
+    )[:, 0, ::-1].astype(np.float32) / 255.0
+
+    robot_xy = np.asarray(robot_position_xy, dtype=np.float32).reshape(2)
+    cell_centers_xy = np.asarray(
+        [
+            (
+                (cell_key[0] + 0.5) * float(state.config.resolution_m),
+                (cell_key[1] + 0.5) * float(state.config.resolution_m),
+            )
+            for cell_key, _ in visible_cells
+        ],
+        dtype=np.float32,
+    )
+    radial_distance = np.linalg.norm(cell_centers_xy - robot_xy[None, :], axis=1)
+    edge_fade = 1.0 - np.clip(radial_distance / max(float(state.config.size_m) * 0.5, 1.0e-6), 0.0, 1.0)
+
+    blended_rgb = np.clip(0.8 * confidence_colors_rgb + 0.2 * height_colors_rgb, 0.0, 1.0)
+    alpha = np.clip(0.15 + 0.65 * confidence + 0.2 * edge_fade, 0.0, 1.0)
+    return np.concatenate([blended_rgb, alpha[:, None]], axis=1).astype(np.float32, copy=False)
+
+
+def build_local_elevation_map_layers(
+    state: RollingElevationMapState,
+    *,
+    robot_position_xy,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    config = state.config
+    cell_count = max(1, int(round(float(config.size_m) / float(config.resolution_m))))
+    robot_xy = np.asarray(robot_position_xy, dtype=np.float32).reshape(2)
+    half_extent = float(config.size_m) * 0.5
+    origin_x = float(robot_xy[0] - half_extent)
+    origin_y = float(robot_xy[1] - half_extent)
+
+    elevation = np.zeros((cell_count, cell_count), dtype=np.float32)
+    variance = np.full((cell_count, cell_count), float(config.max_variance), dtype=np.float32)
+    confidence = np.zeros((cell_count, cell_count), dtype=np.float32)
+    observed = np.zeros((cell_count, cell_count), dtype=bool)
+
+    visible_cells = _collect_visible_elevation_cells(
+        state,
+        bounds=(origin_x, origin_x + float(config.size_m), origin_y, origin_y + float(config.size_m)),
+    )
+    if not visible_cells:
+        return elevation, variance, confidence, observed
+
+    colors_rgba = _build_visible_elevation_cell_rgba(
+        state,
+        visible_cells=visible_cells,
+        robot_position_xy=robot_xy,
+    )
+    for (cell_key, cell_height), color_rgba in zip(visible_cells, colors_rgba, strict=True):
+        row = int(np.floor((((cell_key[1] + 0.5) * float(config.resolution_m)) - origin_y) / float(config.resolution_m)))
+        col = int(np.floor((((cell_key[0] + 0.5) * float(config.resolution_m)) - origin_x) / float(config.resolution_m)))
+        if row < 0 or row >= cell_count or col < 0 or col >= cell_count:
+            continue
+        elevation[row, col] = float(cell_height)
+        variance[row, col] = float(state.variance_by_cell.get(cell_key, config.max_variance))
+        confidence[row, col] = float(color_rgba[3])
+        observed[row, col] = True
+
+    confidence[observed] = 1.0 - np.clip(
+        (variance[observed] - float(config.min_variance))
+        / max(float(config.max_variance - config.min_variance), 1.0e-6),
+        0.0,
+        1.0,
+    )
+
+    observed_indices = np.argwhere(observed)
+    row_min, col_min = observed_indices.min(axis=0)
+    row_max, col_max = observed_indices.max(axis=0)
+    filled = observed.copy()
+    for _ in range(3):
+        pending_updates: list[tuple[int, int, float, float]] = []
+        for row in range(max(0, row_min - 1), min(cell_count, row_max + 2)):
+            for col in range(max(0, col_min - 1), min(cell_count, col_max + 2)):
+                if filled[row, col]:
+                    continue
+                neighbor_heights: list[float] = []
+                neighbor_variances: list[float] = []
+                for d_row in (-1, 0, 1):
+                    for d_col in (-1, 0, 1):
+                        if d_row == 0 and d_col == 0:
+                            continue
+                        n_row = row + d_row
+                        n_col = col + d_col
+                        if n_row < 0 or n_row >= cell_count or n_col < 0 or n_col >= cell_count or not filled[n_row, n_col]:
+                            continue
+                        neighbor_heights.append(float(elevation[n_row, n_col]))
+                        neighbor_variances.append(float(variance[n_row, n_col]))
+                if len(neighbor_heights) < 3:
+                    continue
+                pending_updates.append(
+                    (
+                        row,
+                        col,
+                        float(np.mean(neighbor_heights)),
+                        float(min(config.max_variance, np.mean(neighbor_variances) + config.motion_variance_scale)),
+                    )
+                )
+        if not pending_updates:
+            break
+        for row, col, height_value, variance_value in pending_updates:
+            elevation[row, col] = height_value
+            variance[row, col] = variance_value
+            filled[row, col] = True
+
+    confidence[filled] = 1.0 - np.clip(
+        (variance[filled] - float(config.min_variance))
+        / max(float(config.max_variance - config.min_variance), 1.0e-6),
+        0.0,
+        1.0,
+    )
+    observed = filled
+    return elevation, variance, confidence, observed
+
+
+def build_elevation_surface_mesh_payload(
+    state: RollingElevationMapState,
+    *,
+    robot_position_w,
+    preview_origin=(0.0, 0.0, 0.9),
+    base_height_offset: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    robot_position = np.asarray(robot_position_w, dtype=np.float32).reshape(3)
+    preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
+    elevation_grid, _, confidence_grid, observed_grid = build_local_elevation_map_layers(
+        state,
+        robot_position_xy=robot_position[:2],
+    )
+    rows, cols = elevation_grid.shape
+    vertex_rows = rows + 1
+    vertex_cols = cols + 1
+    vertex_count = vertex_rows * vertex_cols
+
+    vertices = np.zeros((vertex_count, 3), dtype=np.float32)
+    if not np.any(observed_grid):
+        return vertices, confidence_grid, observed_grid
+
+    observed_heights = elevation_grid[observed_grid]
+    relative_base_height = float(observed_heights.min() - float(robot_position[2]) + float(preview_origin_array[2]) - base_height_offset)
+    resolution = float(state.config.resolution_m)
+    half_extent_x = cols * resolution * 0.5
+    half_extent_y = rows * resolution * 0.5
+
+    vertex_heights = np.full((vertex_rows, vertex_cols), relative_base_height, dtype=np.float32)
+    vertex_valid = np.zeros((vertex_rows, vertex_cols), dtype=bool)
+    for vertex_row in range(vertex_rows):
+        for vertex_col in range(vertex_cols):
+            adjacent_heights: list[float] = []
+            for cell_row in range(max(0, vertex_row - 1), min(rows, vertex_row + 1)):
+                for cell_col in range(max(0, vertex_col - 1), min(cols, vertex_col + 1)):
+                    if observed_grid[cell_row, cell_col]:
+                        adjacent_heights.append(float(elevation_grid[cell_row, cell_col] - robot_position[2] + preview_origin_array[2]))
+            if adjacent_heights:
+                vertex_heights[vertex_row, vertex_col] = float(np.mean(adjacent_heights))
+                vertex_valid[vertex_row, vertex_col] = True
+
+    for vertex_row in range(vertex_rows):
+        for vertex_col in range(vertex_cols):
+            vertex_index = vertex_row * vertex_cols + vertex_col
+            vertices[vertex_index] = np.array(
+                [
+                    -half_extent_x + vertex_col * resolution + float(preview_origin_array[0]),
+                    -half_extent_y + vertex_row * resolution + float(preview_origin_array[1]),
+                    vertex_heights[vertex_row, vertex_col],
+                ],
+                dtype=np.float32,
+            )
+
+    renderable_mask = observed_grid.copy()
+    for cell_row in range(rows):
+        for cell_col in range(cols):
+            renderable_mask[cell_row, cell_col] = bool(
+                observed_grid[cell_row, cell_col]
+                and vertex_valid[cell_row, cell_col]
+                and vertex_valid[cell_row, cell_col + 1]
+                and vertex_valid[cell_row + 1, cell_col]
+                and vertex_valid[cell_row + 1, cell_col + 1]
+            )
+
+    return vertices, confidence_grid.astype(np.float32, copy=False), renderable_mask
+
+
 def compute_preview_relative_body_positions(
     root_position_w,
     body_positions_w,
@@ -1253,7 +1606,22 @@ def build_elevation_surface_mesh_data(
 
     robot_position = np.asarray(robot_position_w, dtype=np.float32).reshape(3)
     preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
-    cell_items = sorted(state.observed_height_by_cell.items())
+    robot_xy = robot_position[:2]
+    half_extent = float(state.config.size_m) * 0.5
+    bounds = (
+        float(robot_xy[0] - half_extent),
+        float(robot_xy[0] + half_extent),
+        float(robot_xy[1] - half_extent),
+        float(robot_xy[1] + half_extent),
+    )
+    cell_items = _collect_visible_elevation_cells(state, bounds=bounds)
+    if not cell_items:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0,), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
     height_lookup_world = {cell_key: float(height) for cell_key, height in cell_items}
     heights_rel = np.asarray(
         [height - float(robot_position[2]) + float(preview_origin_array[2]) for height in height_lookup_world.values()],
@@ -1331,6 +1699,68 @@ def build_elevation_surface_mesh_data(
         np.asarray(face_vertex_indices, dtype=np.int32),
         np.asarray(display_colors, dtype=np.float32),
     )
+
+
+def build_elevation_surface_column_data(
+    state: RollingElevationMapState,
+    *,
+    robot_position_w,
+    preview_origin=(0.0, 0.0, 0.9),
+    base_height_offset: float = 0.05,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if not isinstance(state, RollingElevationMapState):
+        raise TypeError(f"Expected RollingElevationMapState, got {type(state)!r}.")
+    if not state.observed_height_by_cell:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
+
+    robot_position = np.asarray(robot_position_w, dtype=np.float32).reshape(3)
+    preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
+    robot_xy = robot_position[:2]
+    half_extent = float(state.config.size_m) * 0.5
+    bounds = (
+        float(robot_xy[0] - half_extent),
+        float(robot_xy[0] + half_extent),
+        float(robot_xy[1] - half_extent),
+        float(robot_xy[1] + half_extent),
+    )
+    cell_items = _collect_visible_elevation_cells(state, bounds=bounds)
+    if not cell_items:
+        return (
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+            np.zeros((0, 3), dtype=np.float32),
+        )
+
+    world_heights = np.asarray([height for _, height in cell_items], dtype=np.float32)
+    relative_tops = world_heights - float(robot_position[2]) + float(preview_origin_array[2])
+    base_height = float(relative_tops.min() - float(base_height_offset))
+    colors_rgba = _build_visible_elevation_cell_rgba(
+        state,
+        visible_cells=cell_items,
+        robot_position_xy=robot_xy,
+    )
+
+    centers = np.zeros((len(cell_items), 3), dtype=np.float32)
+    half_sizes = np.zeros((len(cell_items), 3), dtype=np.float32)
+    half_resolution = float(state.config.resolution_m) * 0.5
+
+    for item_index, ((cell_x, cell_y), cell_height_world) in enumerate(cell_items):
+        x_min, x_max, y_min, y_max = _cell_bounds_from_index((cell_x, cell_y), resolution_m=state.config.resolution_m)
+        center_x = float((x_min + x_max) * 0.5 - robot_position[0] + preview_origin_array[0])
+        center_y = float((y_min + y_max) * 0.5 - robot_position[1] + preview_origin_array[1])
+        top_height = float(cell_height_world - robot_position[2] + preview_origin_array[2])
+        column_height = max(top_height - base_height, 1e-4)
+        centers[item_index] = np.array([center_x, center_y, base_height + column_height * 0.5], dtype=np.float32)
+        half_sizes[item_index] = np.array(
+            [half_resolution, half_resolution, column_height * 0.5],
+            dtype=np.float32,
+        )
+
+    return centers, half_sizes, colors_rgba
 
 
 def _discover_single_display_active_gpu(*, command_runner) -> int | None:

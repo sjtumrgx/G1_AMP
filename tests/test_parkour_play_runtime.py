@@ -93,6 +93,12 @@ def test_add_play_runtime_args_accepts_new_flags():
             "--show_depth_coverage",
             "--show_elevation_map_window",
             "--show_elevation_viewport",
+            "--mujoco_elevation_capture_path",
+            "viewer.mp4",
+            "--mujoco_elevation_frame_dir",
+            "viewer_frames",
+            "--mujoco_elevation_screenshot_path",
+            "viewer.png",
             "--normals_panel",
             "--route_overlay",
             "--foot_contact_overlay",
@@ -128,6 +134,9 @@ def test_add_play_runtime_args_accepts_new_flags():
     assert args.show_depth_coverage is True
     assert args.show_elevation_map_window is True
     assert args.show_elevation_viewport is True
+    assert args.mujoco_elevation_capture_path == "viewer.mp4"
+    assert args.mujoco_elevation_frame_dir == "viewer_frames"
+    assert args.mujoco_elevation_screenshot_path == "viewer.png"
     assert args.normals_panel is True
     assert args.route_overlay is True
     assert args.foot_contact_overlay is True
@@ -1273,6 +1282,121 @@ def test_build_elevation_surface_mesh_data_omits_unknown_cells():
     assert face_counts.size == 0
     assert face_indices.size == 0
     assert display_colors.size == 0
+
+
+def test_build_elevation_surface_mesh_data_crops_to_robot_centered_local_window():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    state.observed_height_by_cell[(0, 0)] = 0.2
+    state.last_seen_step_by_cell[(0, 0)] = 1
+    state.observation_count_by_cell[(0, 0)] = 1
+    state.observed_height_by_cell[(8, 8)] = 1.4
+    state.last_seen_step_by_cell[(8, 8)] = 1
+    state.observation_count_by_cell[(8, 8)] = 1
+
+    points, _, _, _ = module.build_elevation_surface_mesh_data(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    )
+
+    assert points.size > 0
+    assert np.all(points[:, 0] < 4.0)
+    assert np.all(points[:, 1] < 4.0)
+
+
+def test_build_elevation_surface_column_data_uses_visible_cells_and_preserves_blank_unknowns():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    state.observed_height_by_cell[(0, 0)] = 0.5
+    state.last_seen_step_by_cell[(0, 0)] = 1
+    state.observation_count_by_cell[(0, 0)] = 4
+    state.observed_height_by_cell[(1, 0)] = 1.1
+    state.last_seen_step_by_cell[(1, 0)] = 1
+    state.observation_count_by_cell[(1, 0)] = 1
+    state.observed_height_by_cell[(7, 7)] = 2.0
+    state.last_seen_step_by_cell[(7, 7)] = 1
+    state.observation_count_by_cell[(7, 7)] = 1
+
+    centers, half_sizes, colors = module.build_elevation_surface_column_data(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.4], dtype=np.float32),
+    )
+
+    assert centers.shape == (2, 3)
+    assert half_sizes.shape == (2, 3)
+    assert colors.shape == (2, 4)
+    assert np.all(half_sizes[:, 2] > 0.0)
+    assert np.all(np.abs(centers[:, 0]) <= 2.5)
+    assert np.all(np.abs(centers[:, 1]) <= 2.5)
+    assert np.all(colors[:, 3] > 0.0)
+    assert colors[0, 3] >= colors[1, 3]
+
+
+def test_filter_elevation_observation_points_removes_bottom_rows_and_self_hits():
+    module = load_module()
+    ray_hits = np.array(
+        [
+            [[0.0, 0.0, 0.2], [0.2, 0.0, 0.3]],
+            [[0.1, 0.1, 0.4], [2.0, 2.0, 0.5]],
+        ],
+        dtype=np.float32,
+    )
+    robot_body_positions = np.array([[0.0, 0.0, 0.2]], dtype=np.float32)
+
+    filtered = module.filter_elevation_observation_points(
+        ray_hits,
+        robot_body_positions_w=robot_body_positions,
+        bottom_crop_fraction=0.5,
+        self_hit_distance_m=0.15,
+    )
+
+    assert filtered.shape == (1, 3)
+    np.testing.assert_allclose(filtered[0], np.array([0.2, 0.0, 0.3], dtype=np.float32))
+
+
+def test_integrate_elevation_map_observations_tracks_variance_and_reduces_with_repeat_hits():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        sensor_origin_w=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+    variance_after_first = state.variance_by_cell[(0, 0)]
+
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.25]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        sensor_origin_w=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    assert state.variance_by_cell[(0, 0)] <= variance_after_first
+    assert state.observation_count_by_cell[(0, 0)] == 2
+
+
+def test_build_elevation_surface_mesh_payload_returns_dense_mesh_and_confidence_layers():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2], [1.1, 0.1, 0.8], [1.1, 1.1, 0.7]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        sensor_origin_w=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    vertices, confidence_grid, valid_grid = module.build_elevation_surface_mesh_payload(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.5], dtype=np.float32),
+    )
+
+    assert vertices.shape[1] == 3
+    assert confidence_grid.ndim == 2
+    assert valid_grid.ndim == 2
+    assert np.any(valid_grid)
+    assert np.any(confidence_grid[valid_grid] > 0.0)
 
 
 def test_build_elevation_surface_mesh_data_bridges_neighbor_height_steps():
