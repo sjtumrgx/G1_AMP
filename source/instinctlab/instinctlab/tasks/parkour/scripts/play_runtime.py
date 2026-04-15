@@ -448,8 +448,8 @@ def resolve_play_visualization_config(env_cfg, options) -> PlayVisualizationConf
 
 def build_default_tracking_camera_specs() -> list[TrackingCameraSpec]:
     return [
-        TrackingCameraSpec("hero", eye_offset=(-3.4, -1.1, 1.45), target_offset=(0.9, 0.0, 0.32)),
-        TrackingCameraSpec("side", eye_offset=(0.15, -3.3, 1.35), target_offset=(0.8, 0.0, 0.4)),
+        TrackingCameraSpec("hero", eye_offset=(-3.4, -1.1, 1.45), target_offset=(0.9, 0.0, 0.2)),
+        TrackingCameraSpec("side", eye_offset=(0.15, -3.3, 1.35), target_offset=(0.8, 0.0, 0.25)),
         TrackingCameraSpec("overview", eye_offset=(-1.0, 0.0, 5.5), target_offset=(1.0, 0.0, 0.7)),
     ]
 
