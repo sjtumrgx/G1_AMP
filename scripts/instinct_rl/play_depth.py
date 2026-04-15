@@ -132,9 +132,7 @@ from mujoco_elevation_viewer import (
     MuJoCoElevationViewerConfig,
     MuJoCoElevationViewerRig,
     build_mujoco_elevation_capture_path,
-    build_mujoco_elevation_frame_dir,
     build_mujoco_elevation_log_path,
-    build_mujoco_elevation_screenshot_path,
 )
 
 import gymnasium as gym
@@ -308,6 +306,17 @@ def _read_camera_ray_hits(env) -> np.ndarray | None:
     return np.asarray(ray_hits_env0, dtype=np.float32)
 
 
+def _read_camera_ray_image_shape(env) -> tuple[int, int] | None:
+    camera_sensor = env.unwrapped.scene.sensors["camera"]
+    camera_cfg = getattr(camera_sensor, "cfg", None)
+    pattern_cfg = getattr(camera_cfg, "pattern_cfg", None)
+    height = getattr(pattern_cfg, "height", None)
+    width = getattr(pattern_cfg, "width", None)
+    if height is None or width is None:
+        return None
+    return int(height), int(width)
+
+
 def _update_elevation_map_state(env, elevation_map_state) -> None:
     if elevation_map_state is None:
         return
@@ -318,6 +327,7 @@ def _update_elevation_map_state(env, elevation_map_state) -> None:
     filtered_ray_hits_w = filter_elevation_observation_points(
         ray_hits_w,
         robot_body_positions_w=_read_robot_body_positions(robot),
+        image_shape=_read_camera_ray_image_shape(env),
     )
     if filtered_ray_hits_w.size == 0:
         return
@@ -1053,16 +1063,8 @@ def main():
                 if args_cli.mujoco_elevation_capture_path is not None
                 else build_mujoco_elevation_capture_path(video_output_path)
             )
-            mujoco_frame_dir = (
-                args_cli.mujoco_elevation_frame_dir
-                if args_cli.mujoco_elevation_frame_dir is not None
-                else build_mujoco_elevation_frame_dir(artifact_seed_path)
-            )
-            mujoco_screenshot_path = (
-                args_cli.mujoco_elevation_screenshot_path
-                if args_cli.mujoco_elevation_screenshot_path is not None
-                else build_mujoco_elevation_screenshot_path(artifact_seed_path)
-            )
+            mujoco_frame_dir = args_cli.mujoco_elevation_frame_dir
+            mujoco_screenshot_path = args_cli.mujoco_elevation_screenshot_path
             mujoco_log_path = build_mujoco_elevation_log_path(artifact_seed_path)
             mujoco_elevation_viewer = MuJoCoElevationViewerRig(
                 config=MuJoCoElevationViewerConfig(
@@ -1097,9 +1099,10 @@ def main():
         if mujoco_elevation_viewer is not None:
             robot = env.unwrapped.scene["robot"]
             preview_root_position, preview_root_quat, preview_joint_positions = _read_mujoco_sync_state(robot)
-            preview_vertices, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
+            preview_vertices, preview_height, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
                 shared_elevation_map_state,
                 robot_position_w=preview_root_position,
+                include_height_grid=True,
             )
             mujoco_elevation_viewer.update(
                 timestep=0,
@@ -1107,6 +1110,7 @@ def main():
                 root_quat_w=preview_root_quat,
                 joint_positions_by_name=preview_joint_positions,
                 surface_vertices=preview_vertices,
+                surface_scalar=preview_height,
                 surface_confidence=preview_confidence,
                 surface_valid=preview_valid,
             )
@@ -1166,9 +1170,10 @@ def main():
             if mujoco_elevation_viewer is not None:
                 robot = env.unwrapped.scene["robot"]
                 preview_root_position, preview_root_quat, preview_joint_positions = _read_mujoco_sync_state(robot)
-                preview_vertices, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
+                preview_vertices, preview_height, preview_confidence, preview_valid = build_elevation_surface_mesh_payload(
                     shared_elevation_map_state,
                     robot_position_w=preview_root_position,
+                    include_height_grid=True,
                 )
                 mujoco_elevation_viewer.update(
                     timestep=timestep,
@@ -1176,6 +1181,7 @@ def main():
                     root_quat_w=preview_root_quat,
                     joint_positions_by_name=preview_joint_positions,
                     surface_vertices=preview_vertices,
+                    surface_scalar=preview_height,
                     surface_confidence=preview_confidence,
                     surface_valid=preview_valid,
                 )

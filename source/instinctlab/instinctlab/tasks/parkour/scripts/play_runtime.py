@@ -1,4 +1,5 @@
 import argparse
+import copy
 from datetime import datetime
 import math
 from dataclasses import dataclass, field
@@ -344,6 +345,7 @@ def apply_play_runtime_overrides(env_cfg, options) -> None:
     if visualization.depth_coverage:
         env_cfg.scene.camera.debug_vis = True
     if visualization.ghost_reference:
+        _ensure_ghost_reference_robot(getattr(env_cfg, "scene", None))
         motion_reference = getattr(env_cfg.scene, "motion_reference", None)
         if motion_reference is not None:
             _configure_ghost_reference_preview(motion_reference)
@@ -590,17 +592,29 @@ def filter_elevation_observation_points(
     ray_hits_w,
     *,
     robot_body_positions_w=None,
-    bottom_crop_fraction: float = 0.3,
-    self_hit_distance_m: float = 0.16,
+    image_shape: tuple[int, int] | None = None,
+    bottom_crop_fraction: float = 0.2,
+    self_hit_distance_m: float = 0.2,
 ) -> np.ndarray:
     points = np.asarray(ray_hits_w, dtype=np.float32)
-    if points.ndim >= 3 and points.shape[-1] == 3 and bottom_crop_fraction > 0.0:
-        keep_rows = max(1, int(round(points.shape[0] * (1.0 - float(np.clip(bottom_crop_fraction, 0.0, 0.95))))))
-        points = points[:keep_rows, ...]
-    filtered_points = points.reshape(-1, 3)
+    original_shape = tuple(int(dimension) for dimension in points.shape)
+    points_for_crop = points
+    if points.ndim == 2 and points.shape[-1] == 3 and image_shape is not None:
+        image_height, image_width = (max(1, int(image_shape[0])), max(1, int(image_shape[1])))
+        if image_height * image_width == points.shape[0]:
+            points_for_crop = points.reshape(image_height, image_width, 3)
+    if points_for_crop.ndim >= 3 and points_for_crop.shape[-1] == 3 and bottom_crop_fraction > 0.0:
+        keep_rows = max(
+            1,
+            int(round(points_for_crop.shape[0] * (1.0 - float(np.clip(bottom_crop_fraction, 0.0, 0.95))))),
+        )
+        points_for_crop = points_for_crop[:keep_rows, ...]
+    filtered_points = points_for_crop.reshape(-1, 3)
+    post_crop_count = int(filtered_points.shape[0])
     if filtered_points.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
     filtered_points = filtered_points[np.isfinite(filtered_points).all(axis=1)]
+    finite_count = int(filtered_points.shape[0])
     if filtered_points.size == 0 or robot_body_positions_w is None:
         return filtered_points
     body_positions = np.asarray(robot_body_positions_w, dtype=np.float32).reshape(-1, 3)
@@ -610,7 +624,8 @@ def filter_elevation_observation_points(
         np.sum((filtered_points[:, None, :] - body_positions[None, :, :]) ** 2, axis=-1),
         axis=1,
     )
-    return filtered_points[min_squared_distance >= float(self_hit_distance_m) ** 2]
+    kept_mask = min_squared_distance >= float(self_hit_distance_m) ** 2
+    return filtered_points[kept_mask]
 
 
 def render_elevation_map_panel(
@@ -1027,6 +1042,37 @@ def _configure_ghost_reference_preview(motion_reference) -> None:
     offset = np.asarray(getattr(motion_reference, "visualizing_robot_offset", (0.0, 0.0, 0.0)), dtype=np.float32)
     if offset.shape != (3,) or np.allclose(offset, 0.0):
         motion_reference.visualizing_robot_offset = (0.0, 1.5, 0.0)
+
+
+def _derive_ghost_reference_prim_path(scene) -> str | None:
+    robot_cfg = getattr(scene, "robot", None)
+    robot_prim_path = getattr(robot_cfg, "prim_path", None)
+    if isinstance(robot_prim_path, str) and robot_prim_path.endswith("/Robot"):
+        return f"{robot_prim_path[:-len('/Robot')]}/RobotReference"
+
+    motion_reference = getattr(scene, "motion_reference", None)
+    reference_prim_path = getattr(motion_reference, "reference_prim_path", None)
+    if isinstance(reference_prim_path, str) and "/" in reference_prim_path:
+        return reference_prim_path.rsplit("/", 1)[0]
+    return None
+
+
+def _ensure_ghost_reference_robot(scene) -> None:
+    if scene is None or getattr(scene, "robot_reference", None) is not None:
+        return
+
+    robot_cfg = getattr(scene, "robot", None)
+    ghost_reference_prim_path = _derive_ghost_reference_prim_path(scene)
+    if robot_cfg is None or ghost_reference_prim_path is None:
+        return
+
+    if hasattr(robot_cfg, "replace"):
+        scene.robot_reference = robot_cfg.replace(prim_path=ghost_reference_prim_path)
+        return
+
+    robot_reference_cfg = copy.deepcopy(robot_cfg)
+    setattr(robot_reference_cfg, "prim_path", ghost_reference_prim_path)
+    scene.robot_reference = robot_reference_cfg
 
 
 def _get_play_visualization_config(options) -> PlayVisualizationConfig:
@@ -1498,6 +1544,49 @@ def build_local_elevation_map_layers(
             variance[row, col] = variance_value
             filled[row, col] = True
 
+    center_fill_radius_cells = max(2, int(round(0.45 / max(float(config.resolution_m), 1.0e-6))))
+    center_index = np.array([cell_count // 2, cell_count // 2], dtype=np.int32)
+    pending_center_updates: list[tuple[int, int, float, float]] = []
+    for row in range(cell_count):
+        for col in range(cell_count):
+            if filled[row, col]:
+                continue
+            if np.linalg.norm(np.array([row, col], dtype=np.float32) - center_index.astype(np.float32)) > float(
+                center_fill_radius_cells
+            ):
+                continue
+            neighbor_heights: list[float] = []
+            neighbor_variances: list[float] = []
+            neighbor_distances: list[float] = []
+            for d_row in range(-2, 3):
+                for d_col in range(-2, 3):
+                    if d_row == 0 and d_col == 0:
+                        continue
+                    n_row = row + d_row
+                    n_col = col + d_col
+                    if n_row < 0 or n_row >= cell_count or n_col < 0 or n_col >= cell_count or not filled[n_row, n_col]:
+                        continue
+                    neighbor_heights.append(float(elevation[n_row, n_col]))
+                    neighbor_variances.append(float(variance[n_row, n_col]))
+                    neighbor_distances.append(float(np.hypot(d_row, d_col)))
+            if len(neighbor_heights) < 3:
+                continue
+            weights = 1.0 / np.clip(np.asarray(neighbor_distances, dtype=np.float32), 1.0, None)
+            heights_array = np.asarray(neighbor_heights, dtype=np.float32)
+            variances_array = np.asarray(neighbor_variances, dtype=np.float32)
+            pending_center_updates.append(
+                (
+                    row,
+                    col,
+                    float(np.sum(weights * heights_array) / np.sum(weights)),
+                    float(min(config.max_variance, np.mean(variances_array) + config.motion_variance_scale * 1.5)),
+                )
+            )
+    for row, col, height_value, variance_value in pending_center_updates:
+        elevation[row, col] = height_value
+        variance[row, col] = variance_value
+        filled[row, col] = True
+
     confidence[filled] = 1.0 - np.clip(
         (variance[filled] - float(config.min_variance))
         / max(float(config.max_variance - config.min_variance), 1.0e-6),
@@ -1514,7 +1603,8 @@ def build_elevation_surface_mesh_payload(
     robot_position_w,
     preview_origin=(0.0, 0.0, 0.9),
     base_height_offset: float = 0.05,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    include_height_grid: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     robot_position = np.asarray(robot_position_w, dtype=np.float32).reshape(3)
     preview_origin_array = np.asarray(preview_origin, dtype=np.float32).reshape(3)
     elevation_grid, _, confidence_grid, observed_grid = build_local_elevation_map_layers(
@@ -1528,6 +1618,8 @@ def build_elevation_surface_mesh_payload(
 
     vertices = np.zeros((vertex_count, 3), dtype=np.float32)
     if not np.any(observed_grid):
+        if include_height_grid:
+            return vertices, elevation_grid.astype(np.float32, copy=False), confidence_grid, observed_grid
         return vertices, confidence_grid, observed_grid
 
     observed_heights = elevation_grid[observed_grid]
@@ -1572,6 +1664,13 @@ def build_elevation_surface_mesh_payload(
                 and vertex_valid[cell_row + 1, cell_col + 1]
             )
 
+    if include_height_grid:
+        return (
+            vertices,
+            elevation_grid.astype(np.float32, copy=False),
+            confidence_grid.astype(np.float32, copy=False),
+            renderable_mask,
+        )
     return vertices, confidence_grid.astype(np.float32, copy=False), renderable_mask
 
 

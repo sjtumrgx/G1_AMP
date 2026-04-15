@@ -28,6 +28,13 @@ def load_module():
     return module
 
 
+class ReplaceableCfg(SimpleNamespace):
+    def replace(self, **kwargs):
+        values = vars(self).copy()
+        values.update(kwargs)
+        return ReplaceableCfg(**values)
+
+
 def make_fake_env_cfg():
     return SimpleNamespace(
         seed=7,
@@ -35,6 +42,7 @@ def make_fake_env_cfg():
         curriculum=SimpleNamespace(terrain_levels="keep"),
         scene=SimpleNamespace(
             num_envs=8,
+            robot=ReplaceableCfg(prim_path="{ENV_REGEX_NS}/Robot"),
             camera=SimpleNamespace(debug_vis=False, data_types=["distance_to_image_plane"]),
             terrain=SimpleNamespace(
                 debug_vis=False,
@@ -329,7 +337,21 @@ def test_apply_play_runtime_overrides_enables_ghost_reference_and_obstacle_edges
     assert env_cfg.scene.motion_reference.debug_vis is True
     assert env_cfg.scene.motion_reference.visualizing_robot_from == "reference_frame"
     assert env_cfg.scene.motion_reference.visualizing_robot_offset == (0.0, 1.5, 0.0)
+    assert env_cfg.scene.robot_reference.prim_path == "{ENV_REGEX_NS}/RobotReference"
     assert env_cfg.scene.terrain.debug_vis is True
+
+
+def test_ensure_ghost_reference_robot_preserves_existing_reference_asset():
+    module = load_module()
+    scene = SimpleNamespace(
+        robot=ReplaceableCfg(prim_path="{ENV_REGEX_NS}/Robot"),
+        robot_reference=ReplaceableCfg(prim_path="{ENV_REGEX_NS}/ExistingGhost"),
+        motion_reference=SimpleNamespace(reference_prim_path="/World/envs/env_.*/RobotReference/torso_link"),
+    )
+
+    module._ensure_ghost_reference_robot(scene)
+
+    assert scene.robot_reference.prim_path == "{ENV_REGEX_NS}/ExistingGhost"
 
 
 def test_apply_play_runtime_overrides_treats_keyboard_control_like_center_spawn():
@@ -1354,6 +1376,32 @@ def test_filter_elevation_observation_points_removes_bottom_rows_and_self_hits()
     np.testing.assert_allclose(filtered[0], np.array([0.2, 0.0, 0.3], dtype=np.float32))
 
 
+def test_filter_elevation_observation_points_applies_bottom_crop_to_flattened_camera_layout():
+    module = load_module()
+    ray_hits = np.array(
+        [
+            [0.0, 0.0, 0.1],
+            [0.1, 0.0, 0.1],
+            [0.2, 0.0, 0.1],
+            [0.3, 0.0, 0.1],
+            [9.0, 9.0, 9.0],
+            [9.1, 9.0, 9.0],
+            [9.2, 9.0, 9.0],
+            [9.3, 9.0, 9.0],
+        ],
+        dtype=np.float32,
+    )
+
+    filtered = module.filter_elevation_observation_points(
+        ray_hits,
+        image_shape=(2, 4),
+        bottom_crop_fraction=0.5,
+    )
+
+    assert filtered.shape == (4, 3)
+    np.testing.assert_allclose(filtered[:, 2], np.full((4,), 0.1, dtype=np.float32))
+
+
 def test_integrate_elevation_map_observations_tracks_variance_and_reduces_with_repeat_hits():
     module = load_module()
     state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
@@ -1377,6 +1425,34 @@ def test_integrate_elevation_map_observations_tracks_variance_and_reduces_with_r
     assert state.observation_count_by_cell[(0, 0)] == 2
 
 
+def test_build_local_elevation_map_layers_fills_small_gap_near_robot_center():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=0.2, size_m=2.0))
+    ring_cells = {
+        (-1, -1): 0.15,
+        (-1, 0): 0.18,
+        (-1, 1): 0.2,
+        (0, -1): 0.17,
+        (0, 1): 0.19,
+        (1, -1): 0.16,
+        (1, 0): 0.18,
+        (1, 1): 0.21,
+    }
+    state.observed_height_by_cell.update(ring_cells)
+    state.variance_by_cell.update({cell: 1.0e-3 for cell in ring_cells})
+
+    elevation, variance, confidence, observed = module.build_local_elevation_map_layers(
+        state,
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+    )
+
+    center = observed.shape[0] // 2
+    assert observed[center, center]
+    assert elevation[center, center] > 0.0
+    assert variance[center, center] > 0.0
+    assert confidence[center, center] > 0.0
+
+
 def test_build_elevation_surface_mesh_payload_returns_dense_mesh_and_confidence_layers():
     module = load_module()
     state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
@@ -1397,6 +1473,29 @@ def test_build_elevation_surface_mesh_payload_returns_dense_mesh_and_confidence_
     assert valid_grid.ndim == 2
     assert np.any(valid_grid)
     assert np.any(confidence_grid[valid_grid] > 0.0)
+
+
+def test_build_elevation_surface_mesh_payload_can_include_height_grid():
+    module = load_module()
+    state = module.create_rolling_elevation_map(module.RollingElevationMapConfig(resolution_m=1.0, size_m=4.0))
+    module.integrate_elevation_map_observations(
+        state,
+        np.array([[0.1, 0.1, 0.2], [1.1, 0.1, 0.8], [1.1, 1.1, 0.7]], dtype=np.float32),
+        robot_position_xy=np.array([0.0, 0.0], dtype=np.float32),
+        sensor_origin_w=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    )
+
+    vertices, height_grid, confidence_grid, valid_grid = module.build_elevation_surface_mesh_payload(
+        state,
+        robot_position_w=np.array([0.0, 0.0, 0.5], dtype=np.float32),
+        include_height_grid=True,
+    )
+
+    assert vertices.shape[1] == 3
+    assert height_grid.ndim == 2
+    assert confidence_grid.shape == height_grid.shape
+    assert valid_grid.shape == height_grid.shape
+    assert np.any(height_grid[valid_grid] > 0.0)
 
 
 def test_build_elevation_surface_mesh_data_bridges_neighbor_height_steps():
