@@ -34,6 +34,12 @@ DEFAULT_SURFACE_RESOLUTION_M = 0.1
 SURFACE_PACKET_SCHEMA_VERSION = 2
 SURFACE_MESH_NAME = "elevation_surface_mesh"
 SURFACE_GEOM_NAME = "elevation_surface"
+UPPER_BOUND_SURFACE_MESH_NAME = "elevation_surface_upper_mesh"
+UPPER_BOUND_SURFACE_GEOM_NAME = "elevation_surface_upper"
+UPPER_BOUND_SURFACE_MATERIAL_NAME = "elevation_surface_upper_material"
+LOWER_BOUND_SURFACE_MESH_NAME = "elevation_surface_lower_mesh"
+LOWER_BOUND_SURFACE_GEOM_NAME = "elevation_surface_lower"
+LOWER_BOUND_SURFACE_MATERIAL_NAME = "elevation_surface_lower_material"
 SURFACE_TEXTURE_NAME = "elevation_surface_texture"
 SURFACE_MATERIAL_NAME = "elevation_surface_material"
 SURFACE_BACKGROUND_TEXTURE_NAME = "elevation_background_texture"
@@ -45,6 +51,10 @@ INVALID_SURFACE_RGB = np.array([255, 255, 255], dtype=np.uint8)
 GRID_LINE_RGB = np.array([232, 236, 242], dtype=np.uint8)
 FRAME_RGBA = np.array([0.96, 0.97, 0.99, 1.0], dtype=np.float32)
 FRAME_EDGE_ORDER = ("south", "north", "west", "east")
+UPPER_BOUND_RGBA = np.array([0.94, 0.97, 1.0, 0.22], dtype=np.float32)
+LOWER_BOUND_RGBA = np.array([0.82, 0.90, 1.0, 0.14], dtype=np.float32)
+BOUND_HEIGHT_MIN_M = 0.015
+BOUND_HEIGHT_MAX_M = 0.09
 HIDDEN_HAND_BODY_NAMES = {
     "left_zero_link",
     "left_one_link",
@@ -69,6 +79,12 @@ class SurfaceViewerHandles:
     surface_geom_id: int
     surface_texture_id: int
     surface_material_id: int
+    upper_bound_mesh_id: int
+    upper_bound_geom_id: int
+    upper_bound_material_id: int
+    lower_bound_mesh_id: int
+    lower_bound_geom_id: int
+    lower_bound_material_id: int
     background_plane_geom_id: int | None
     background_texture_id: int | None
     background_material_id: int | None
@@ -237,13 +253,15 @@ def _build_surface_texture_rgb(
     texture_rgb = np.broadcast_to(INVALID_SURFACE_RGB, (texture_height, texture_width, 3)).copy()
     valid_texture = cv2.resize(valid.astype(np.uint8), (texture_width, texture_height), interpolation=cv2.INTER_NEAREST) > 0
     if np.any(valid_texture):
-        texture_rgb[valid_texture] = _sample_surface_colormap(scalar_texture)[valid_texture]
+        colored = _sample_surface_colormap(scalar_texture).astype(np.float32)
+        colored = 0.82 * colored + 0.18 * 255.0
+        texture_rgb[valid_texture] = np.clip(np.round(colored), 0.0, 255.0).astype(np.uint8)[valid_texture]
     if surface_confidence is not None:
         confidence = np.clip(np.asarray(surface_confidence, dtype=np.float32), 0.0, 1.0)
         if confidence.shape != valid.shape:
             raise ValueError(f"Expected confidence shape {valid.shape}, got {confidence.shape}.")
         confidence_texture = cv2.resize(confidence, (texture_width, texture_height), interpolation=cv2.INTER_LINEAR)
-        brightness = 0.82 + 0.18 * confidence_texture[..., None]
+        brightness = 0.94 + 0.06 * confidence_texture[..., None]
         shaded = np.clip(np.round(texture_rgb.astype(np.float32) * brightness), 0.0, 255.0).astype(np.uint8)
         texture_rgb[valid_texture] = shaded[valid_texture]
 
@@ -312,6 +330,33 @@ def _build_surface_face_indices(surface_valid: np.ndarray, *, render_all_cells: 
     return face_indices, active_face_count
 
 
+def _build_confidence_bound_vertices(
+    *,
+    surface_vertices: np.ndarray,
+    surface_confidence: np.ndarray,
+    surface_valid: np.ndarray,
+    direction: float,
+) -> np.ndarray:
+    confidence = np.clip(np.asarray(surface_confidence, dtype=np.float32), 0.0, 1.0)
+    valid = np.asarray(surface_valid, dtype=bool)
+    rows, cols = confidence.shape
+    vertices = np.asarray(surface_vertices, dtype=np.float32).reshape(rows + 1, cols + 1, 3).copy()
+    vertex_offsets = np.zeros((rows + 1, cols + 1), dtype=np.float32)
+    vertex_counts = np.zeros((rows + 1, cols + 1), dtype=np.float32)
+    cell_offsets = BOUND_HEIGHT_MIN_M + (1.0 - confidence) * (BOUND_HEIGHT_MAX_M - BOUND_HEIGHT_MIN_M)
+    for row in range(rows):
+        for col in range(cols):
+            if not valid[row, col]:
+                continue
+            offset = float(cell_offsets[row, col])
+            vertex_offsets[row : row + 2, col : col + 2] += offset
+            vertex_counts[row : row + 2, col : col + 2] += 1.0
+    active_vertices = vertex_counts > 0.0
+    vertex_offsets[active_vertices] /= vertex_counts[active_vertices]
+    vertices[..., 2][active_vertices] += float(direction) * vertex_offsets[active_vertices]
+    return vertices.reshape(-1, 3)
+
+
 def _derive_surface_scalar_from_vertices(*, surface_vertices: np.ndarray, rows: int, cols: int) -> np.ndarray:
     expected_vertex_count = (rows + 1) * (cols + 1)
     vertices = np.asarray(surface_vertices, dtype=np.float32).reshape(-1, 3)
@@ -375,9 +420,17 @@ def _set_texture_rgb_data(*, model: mujoco.MjModel, texture_id: int, texture_rgb
     raise ValueError(f"Unsupported texture channel count {nchannel}; expected 3 or 4 channels.")
 
 
-def _sync_viewer_assets(viewer, *, mesh_id: int | None = None, texture_ids: tuple[int, ...] = ()) -> None:
+def _sync_viewer_assets(
+    viewer,
+    *,
+    mesh_id: int | None = None,
+    mesh_ids: tuple[int, ...] = (),
+    texture_ids: tuple[int, ...] = (),
+) -> None:
     if mesh_id is not None:
         viewer.update_mesh(mesh_id)
+    for pending_mesh_id in mesh_ids:
+        viewer.update_mesh(pending_mesh_id)
     for texture_id in texture_ids:
         viewer.update_texture(texture_id)
 
@@ -451,11 +504,29 @@ def _compile_g1_viewer_model(
     material.name = SURFACE_MATERIAL_NAME
     material.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = SURFACE_TEXTURE_NAME
     material.texuniform = False
-    material.reflectance = 0.12
-    material.specular = 0.08
-    material.shininess = 0.12
-    material.roughness = 0.76
+    material.reflectance = 0.18
+    material.specular = 0.05
+    material.shininess = 0.08
+    material.roughness = 0.88
     material.rgba = [1.0, 1.0, 1.0, 1.0]
+
+    upper_material = spec.add_material()
+    upper_material.name = UPPER_BOUND_SURFACE_MATERIAL_NAME
+    upper_material.texuniform = False
+    upper_material.reflectance = 0.05
+    upper_material.specular = 0.02
+    upper_material.shininess = 0.02
+    upper_material.roughness = 0.96
+    upper_material.rgba = UPPER_BOUND_RGBA.tolist()
+
+    lower_material = spec.add_material()
+    lower_material.name = LOWER_BOUND_SURFACE_MATERIAL_NAME
+    lower_material.texuniform = False
+    lower_material.reflectance = 0.03
+    lower_material.specular = 0.01
+    lower_material.shininess = 0.02
+    lower_material.roughness = 0.98
+    lower_material.rgba = LOWER_BOUND_RGBA.tolist()
 
     if include_background_plane:
         background_texture = spec.add_texture()
@@ -482,6 +553,14 @@ def _compile_g1_viewer_model(
     mesh.file = "elevation_surface.obj"
     mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
 
+    upper_mesh = spec.add_mesh(name=UPPER_BOUND_SURFACE_MESH_NAME)
+    upper_mesh.file = "elevation_surface.obj"
+    upper_mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
+
+    lower_mesh = spec.add_mesh(name=LOWER_BOUND_SURFACE_MESH_NAME)
+    lower_mesh.file = "elevation_surface.obj"
+    lower_mesh.inertia = mujoco.mjtMeshInertia.mjMESH_INERTIA_SHELL
+
     surface_geom = spec.worldbody.add_geom()
     surface_geom.name = SURFACE_GEOM_NAME
     surface_geom.type = mujoco.mjtGeom.mjGEOM_MESH
@@ -491,6 +570,26 @@ def _compile_g1_viewer_model(
     surface_geom.conaffinity = 0
     surface_geom.contype = 0
     surface_geom.group = 1
+
+    upper_geom = spec.worldbody.add_geom()
+    upper_geom.name = UPPER_BOUND_SURFACE_GEOM_NAME
+    upper_geom.type = mujoco.mjtGeom.mjGEOM_MESH
+    upper_geom.meshname = UPPER_BOUND_SURFACE_MESH_NAME
+    upper_geom.material = UPPER_BOUND_SURFACE_MATERIAL_NAME
+    upper_geom.rgba = UPPER_BOUND_RGBA.tolist()
+    upper_geom.conaffinity = 0
+    upper_geom.contype = 0
+    upper_geom.group = 2
+
+    lower_geom = spec.worldbody.add_geom()
+    lower_geom.name = LOWER_BOUND_SURFACE_GEOM_NAME
+    lower_geom.type = mujoco.mjtGeom.mjGEOM_MESH
+    lower_geom.meshname = LOWER_BOUND_SURFACE_MESH_NAME
+    lower_geom.material = LOWER_BOUND_SURFACE_MATERIAL_NAME
+    lower_geom.rgba = LOWER_BOUND_RGBA.tolist()
+    lower_geom.conaffinity = 0
+    lower_geom.contype = 0
+    lower_geom.group = 2
 
     if include_background_plane:
         background_plane = spec.worldbody.add_geom()
@@ -535,6 +634,16 @@ def _compile_g1_viewer_model(
         surface_geom_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, SURFACE_GEOM_NAME)),
         surface_texture_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_TEXTURE, SURFACE_TEXTURE_NAME)),
         surface_material_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, SURFACE_MATERIAL_NAME)),
+        upper_bound_mesh_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MESH, UPPER_BOUND_SURFACE_MESH_NAME)),
+        upper_bound_geom_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, UPPER_BOUND_SURFACE_GEOM_NAME)),
+        upper_bound_material_id=int(
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, UPPER_BOUND_SURFACE_MATERIAL_NAME)
+        ),
+        lower_bound_mesh_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MESH, LOWER_BOUND_SURFACE_MESH_NAME)),
+        lower_bound_geom_id=int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, LOWER_BOUND_SURFACE_GEOM_NAME)),
+        lower_bound_material_id=int(
+            mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, LOWER_BOUND_SURFACE_MATERIAL_NAME)
+        ),
         background_plane_geom_id=(
             int(mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, SURFACE_BACKGROUND_PLANE_NAME))
             if include_background_plane
@@ -718,6 +827,10 @@ class _SidecarRuntime:
         self.surface_mesh_id = int(self.surface_handles.surface_mesh_id)
         self.surface_geom_id = int(self.surface_handles.surface_geom_id)
         self.surface_texture_id = int(self.surface_handles.surface_texture_id)
+        self.upper_bound_mesh_id = int(self.surface_handles.upper_bound_mesh_id)
+        self.upper_bound_geom_id = int(self.surface_handles.upper_bound_geom_id)
+        self.lower_bound_mesh_id = int(self.surface_handles.lower_bound_mesh_id)
+        self.lower_bound_geom_id = int(self.surface_handles.lower_bound_geom_id)
         self.background_texture_id = (
             None if self.surface_handles.background_texture_id is None else int(self.surface_handles.background_texture_id)
         )
@@ -726,10 +839,12 @@ class _SidecarRuntime:
         )
         self.surface_frame_geom_ids = dict(self.surface_handles.frame_geom_ids)
         _hide_extra_hand_geoms(self.model)
-        self.model.mesh_pos[self.surface_mesh_id] = np.zeros((3,), dtype=np.float64)
-        self.model.mesh_quat[self.surface_mesh_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        self.model.geom_pos[self.surface_geom_id] = np.zeros((3,), dtype=np.float64)
-        self.model.geom_quat[self.surface_geom_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        for mesh_id in (self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id):
+            self.model.mesh_pos[mesh_id] = np.zeros((3,), dtype=np.float64)
+            self.model.mesh_quat[mesh_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        for geom_id in (self.surface_geom_id, self.upper_bound_geom_id, self.lower_bound_geom_id):
+            self.model.geom_pos[geom_id] = np.zeros((3,), dtype=np.float64)
+            self.model.geom_quat[geom_id] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         self._frame_specs = _build_region_frame_specs(
             rows=self.surface_rows,
             cols=self.surface_cols,
@@ -769,8 +884,14 @@ class _SidecarRuntime:
         self._joint_qpos_addr_by_name = self._build_joint_qpos_addr_by_name()
         self._mesh_vertex_count = int(self.model.mesh_vertnum[self.surface_mesh_id])
         self._mesh_face_count = int(self.model.mesh_facenum[self.surface_mesh_id])
-        self._mesh_vert_adr = int(self.model.mesh_vertadr[self.surface_mesh_id])
-        self._mesh_face_adr = int(self.model.mesh_faceadr[self.surface_mesh_id])
+        self._mesh_vert_adr = {
+            mesh_id: int(self.model.mesh_vertadr[mesh_id])
+            for mesh_id in (self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id)
+        }
+        self._mesh_face_adr = {
+            mesh_id: int(self.model.mesh_faceadr[mesh_id])
+            for mesh_id in (self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id)
+        }
         self._texture_width = int(self.model.tex_width[self.surface_texture_id])
         self._texture_height = int(self.model.tex_height[self.surface_texture_id])
         self._prepare_capture_outputs()
@@ -847,15 +968,33 @@ class _SidecarRuntime:
             padded_vertices = np.zeros((self._mesh_vertex_count, 3), dtype=np.float32)
             padded_vertices[: surface_vertices.shape[0]] = surface_vertices
             surface_vertices = padded_vertices
-        self.model.mesh_vert[self._mesh_vert_adr : self._mesh_vert_adr + self._mesh_vertex_count] = surface_vertices[
-            : self._mesh_vertex_count
-        ]
+        upper_bound_vertices = _build_confidence_bound_vertices(
+            surface_vertices=surface_vertices[: self._mesh_vertex_count],
+            surface_confidence=decoded_packet.surface_confidence,
+            surface_valid=decoded_packet.surface_valid,
+            direction=1.0,
+        )
+        lower_bound_vertices = _build_confidence_bound_vertices(
+            surface_vertices=surface_vertices[: self._mesh_vertex_count],
+            surface_confidence=decoded_packet.surface_confidence,
+            surface_valid=decoded_packet.surface_valid,
+            direction=-1.0,
+        )
+        for mesh_id, mesh_vertices in (
+            (self.surface_mesh_id, surface_vertices[: self._mesh_vertex_count]),
+            (self.upper_bound_mesh_id, upper_bound_vertices),
+            (self.lower_bound_mesh_id, lower_bound_vertices),
+        ):
+            mesh_vert_adr = self._mesh_vert_adr[mesh_id]
+            self.model.mesh_vert[mesh_vert_adr : mesh_vert_adr + self._mesh_vertex_count] = mesh_vertices
 
         face_indices, active_face_count = _build_surface_face_indices(
             decoded_packet.surface_valid,
             render_all_cells=False,
         )
-        self.model.mesh_face[self._mesh_face_adr : self._mesh_face_adr + self._mesh_face_count] = face_indices
+        for mesh_id in (self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id):
+            mesh_face_adr = self._mesh_face_adr[mesh_id]
+            self.model.mesh_face[mesh_face_adr : mesh_face_adr + self._mesh_face_count] = face_indices
 
         surface_texture_rgb = _build_surface_texture_rgb(
             surface_scalar=decoded_packet.surface_scalar,
@@ -873,7 +1012,8 @@ class _SidecarRuntime:
         )
 
         mujoco.mj_forward(self.model, self.data)
-        mujoco.mjr_uploadMesh(self.model, self.renderer._mjr_context, self.surface_mesh_id)
+        for mesh_id in (self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id):
+            mujoco.mjr_uploadMesh(self.model, self.renderer._mjr_context, mesh_id)
         mujoco.mjr_uploadTexture(self.model, self.renderer._mjr_context, self.surface_texture_id)
         self._latest_active_faces = active_face_count
         self._latest_active_tiles = int(np.count_nonzero(decoded_packet.surface_valid))
@@ -927,7 +1067,11 @@ class _SidecarRuntime:
                 if version != last_version and packet is not None:
                     with viewer.lock():
                         self._apply_packet(packet)
-                    _sync_viewer_assets(viewer, mesh_id=self.surface_mesh_id, texture_ids=(self.surface_texture_id,))
+                    _sync_viewer_assets(
+                        viewer,
+                        mesh_ids=(self.surface_mesh_id, self.upper_bound_mesh_id, self.lower_bound_mesh_id),
+                        texture_ids=(self.surface_texture_id,),
+                    )
                     self._capture_frame(camera=viewer.cam, timestep=int(packet.get("timestep", 0)))
                     last_version = version
                 viewer.sync()

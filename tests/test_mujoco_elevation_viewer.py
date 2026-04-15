@@ -161,6 +161,8 @@ def test_compile_g1_viewer_model_can_omit_background_plane():
     assert handles.background_texture_id is None
     assert handles.background_material_id is None
     assert handles.surface_geom_id >= 0
+    assert handles.upper_bound_geom_id >= 0
+    assert handles.lower_bound_geom_id >= 0
     assert int(model.ngeom) >= 1
 
 
@@ -216,9 +218,9 @@ def test_sync_viewer_assets_updates_mesh_then_requested_textures():
         def update_texture(self, texture_id: int) -> None:
             calls.append(("texture", texture_id))
 
-    module._sync_viewer_assets(FakeViewer(), mesh_id=7, texture_ids=(11, 13))
+    module._sync_viewer_assets(FakeViewer(), mesh_id=7, mesh_ids=(8, 9), texture_ids=(11, 13))
 
-    assert calls == [("mesh", 7), ("texture", 11), ("texture", 13)]
+    assert calls == [("mesh", 7), ("mesh", 8), ("mesh", 9), ("texture", 11), ("texture", 13)]
 
 
 def test_sync_viewer_assets_supports_texture_only_updates():
@@ -251,6 +253,12 @@ def test_compile_g1_viewer_model_adds_single_surface_mesh_texture_and_frame_geom
     assert handles.surface_geom_id >= 0
     assert handles.surface_texture_id >= 0
     assert handles.surface_material_id >= 0
+    assert handles.upper_bound_mesh_id >= 0
+    assert handles.upper_bound_geom_id >= 0
+    assert handles.upper_bound_material_id >= 0
+    assert handles.lower_bound_mesh_id >= 0
+    assert handles.lower_bound_geom_id >= 0
+    assert handles.lower_bound_material_id >= 0
     assert handles.background_plane_geom_id >= 0
     assert handles.background_texture_id >= 0
     assert handles.background_material_id >= 0
